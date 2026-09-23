@@ -57,7 +57,9 @@ request using a byte-based Poisson sampler. For a request of size `s` and mean
 interval `R`, its inclusion probability is
 `1 - exp(-max(s, 1) / R)`. A selected request contributes `1/p` estimated
 objects and `s/p` estimated bytes. The configured interval must be a positive
-integer and remains fixed for each collection.
+integer and remains fixed once the allocator hooks are installed. The default is 4 MiB; use a
+smaller interval, such as 512 KiB, for denser samples. The estimates remain
+unbiased at either interval, while larger intervals produce fewer samples.
 
 This path is experimental and is not production-qualified. Current local
 measurements exceed the active-collection performance gate; see the
@@ -69,7 +71,7 @@ googlecloudprofiler.start(
     service='hello-profiler',
     service_version='1.0.1',
     enable_memory_profiling=True,
-    memory_sampling_interval_bytes=524288,
+    memory_sampling_interval_bytes=4194304,
 )
 ```
 

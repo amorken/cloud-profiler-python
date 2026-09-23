@@ -16,6 +16,7 @@
 import logging
 import sys
 from googlecloudprofiler import __version__ as version
+from googlecloudprofiler import memory_profiler
 from googlecloudprofiler import client
 
 _started = False
@@ -33,7 +34,8 @@ def start(service=None,
           period_ms=10,
           discovery_service_url=None,
           enable_memory_profiling=False,
-          memory_sampling_interval_bytes=524288):
+          memory_sampling_interval_bytes=(
+              memory_profiler.DEFAULT_SAMPLING_INTERVAL_BYTES)):
   """Starts the profiler.
 
   This function starts a daemon thread which polls the profiler server for
@@ -94,8 +96,9 @@ def start(service=None,
       profiles. This requires the Linux native profiler runtime and is disabled
       by default.
     memory_sampling_interval_bytes: Positive integer mean bytes between
-      allocation samples. Defaults to 524288 (512 KiB). This option is ignored
-      when memory profiling is disabled, but is still validated.
+      allocation samples. Defaults to 4194304 (4 MiB). Use a smaller interval
+      for denser samples. This option is ignored when memory profiling is
+      disabled, but is still validated.
 
   Raises:
     ValueError: If arguments are invalid or if necessary information can't be

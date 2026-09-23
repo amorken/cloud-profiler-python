@@ -20,6 +20,8 @@ from googlecloudprofiler import builder
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SAMPLING_INTERVAL_BYTES = 4 * 1024 * 1024
+
 try:
   from googlecloudprofiler import _profiler
 except ImportError:
@@ -35,7 +37,8 @@ class MemoryProfiler:
   heap size.
   """
 
-  def __init__(self, sampling_interval_bytes=524288):
+  def __init__(self,
+               sampling_interval_bytes=DEFAULT_SAMPLING_INTERVAL_BYTES):
     if (not isinstance(sampling_interval_bytes, int) or
         isinstance(sampling_interval_bytes, bool) or
         sampling_interval_bytes <= 0 or

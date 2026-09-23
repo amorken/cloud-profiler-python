@@ -1,10 +1,24 @@
 """Agent scheduling and upload integration for allocation profiles."""
 
 import base64
+import inspect
 import sys
 import pytest
 
+import googlecloudprofiler
 from googlecloudprofiler import client
+from googlecloudprofiler import memory_profiler
+
+
+def test_default_memory_sampling_interval_is_four_mib():
+  expected = 4 * 1024 * 1024
+  assert memory_profiler.DEFAULT_SAMPLING_INTERVAL_BYTES == expected
+  assert inspect.signature(googlecloudprofiler.start).parameters[
+      'memory_sampling_interval_bytes'].default == expected
+  assert inspect.signature(client.Client.config).parameters[
+      'memory_sampling_interval_bytes'].default == expected
+  assert inspect.signature(memory_profiler.MemoryProfiler).parameters[
+      'sampling_interval_bytes'].default == expected
 
 
 class _Request:

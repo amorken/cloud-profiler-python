@@ -135,7 +135,8 @@ class Client:
   def config(self, project_id, service, service_version, disable_cpu_profiling,
              disable_wall_profiling, period_ms, discovery_service_url,
              enable_memory_profiling=False,
-             memory_sampling_interval_bytes=524288):
+             memory_sampling_interval_bytes=(
+                 memory_profiler.DEFAULT_SAMPLING_INTERVAL_BYTES)):
     """Sets up the client config.
 
     Args:
@@ -160,7 +161,7 @@ class Client:
       enable_memory_profiling: Whether sampled allocation profiles should be
         requested from Cloud Profiler.
       memory_sampling_interval_bytes: Mean bytes between sampled allocation
-        requests.
+        requests. Defaults to 4 MiB; smaller values produce denser samples.
 
     Raises:
       ValueError: If the project ID or service can't be determined from the
