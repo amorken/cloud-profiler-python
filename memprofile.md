@@ -563,8 +563,14 @@ throughput gates.
   performance screen remains too noisy for qualification.
 - [x] Document an allocator hook-switching feasibility decision from CPython
   source without changing hook installation in this iteration.
-- [ ] Run full tests, export stress, and matched ten-pair throughput and p99
-  qualification on 3.12 and 3.13; repeat real Cloud Profiler API readback.
+- [x] Run full available tests, export stress, and matched ten-pair throughput
+  and p99 comparisons on 3.12 and 3.13; repeat real Cloud Profiler API readback.
+- [ ] Meet the <=10% active upper-bound, <=1% installed-idle upper-bound, and
+  <=5% p99 regression gates. The current implementation fails these gates;
+  keep memory profiling opt-in and do not promote it as production qualified.
+- [ ] Measure scheduled-average overhead and repeat qualification under normal
+  CPU affinity after the fixed callback cost is reduced. The pinned runs
+  already fail, so additional affinity runs cannot qualify this revision.
 
 ### Allocator hook-switching feasibility
 
@@ -585,3 +591,57 @@ quiescence protocol, interoperable chaining with tracemalloc/debug/third-party
 hooks, and adversarial allocator replacement and fork tests across the full
 supported runtime matrix. Agent-only `PyMem_SetAllocator` calls at every
 profile boundary are not qualified as a production optimization.
+
+### Qualification result
+
+Reference `6d4ce6e` and candidate `720a439` were independently rebuilt for
+each interpreter with the same recorded compiler and linker commands, including
+`-fno-omit-frame-pointer` and stack-protection flags. The runner verified source
+and extension hashes and the exact loaded binary. Each workload used ten
+randomized reference/candidate pairs with 3-second target runs, 4 MiB sampling,
+CPU 0 affinity, and successful attributed native samples. Figures below are
+percentage throughput loss versus each run's own baseline, with bootstrap 95%
+upper bounds on the median in parentheses.
+Raw paired measurements and build manifests are in
+`benchmarks/results/memory-qualification-20260923-py312.json` and
+`benchmarks/results/memory-qualification-20260923-py313.json`.
+
+| Runtime | Workload | Active loss | Installed-idle loss | p99 change upper bound |
+| --- | --- | ---: | ---: | ---: |
+| 3.12 | small | 9.96% (11.70%) | 3.80% (6.32%) | -0.11% |
+| 3.12 | varied | 7.79% (9.49%) | 1.59% (4.85%) | -0.76% |
+| 3.12 | deep | 0.84% (2.39%) | 0.60% (2.12%) | 1.37% |
+| 3.12 | repeated | 4.18% (5.15%) | 1.36% (2.97%) | 2.09% |
+| 3.12 | one worker | 12.25% (14.62%) | 4.99% (6.40%) | 0.81% |
+| 3.12 | four workers | 12.38% (13.63%) | 1.94% (4.37%) | 7.86% |
+| 3.13 | small | 9.81% (12.14%) | 4.73% (12.36%) | 4.03% |
+| 3.13 | varied | 7.16% (8.83%) | 1.16% (3.41%) | -1.23% |
+| 3.13 | deep | 1.07% (3.12%) | 0.80% (2.37%) | 2.77% |
+| 3.13 | repeated | 4.15% (6.16%) | 2.26% (3.34%) | 2.13% |
+| 3.13 | one worker | 13.16% (16.69%) | 6.34% (9.74%) | 1.42% |
+| 3.13 | four workers | 12.19% (13.84%) | 3.27% (4.78%) | -1.10% |
+
+All installed-idle upper bounds exceed 1%. Small and both worker loops exceed
+the active 10% upper-bound target on both runtimes. Four-worker p99 on 3.12
+also exceeds 5%. These are local microbenchmarks, not a production workload
+measurement; scheduled-average overhead remains unmeasured. In a separate
+pinned Python 3.13 native OBJ malloc probe of 20 million 128-byte requests per
+repeat, five-repeat medians were 4.39 ns/request baseline, 5.66 ns installed
+idle, 8.18 ns active with a near-zero sample rate (zero selections), and 8.00
+ns active at 4 MiB (3,095 selections). This unpaired probe is directional but
+shows that fixed callback work dominates selected-stack work at the default
+rate. Reducing stack-resolution cost alone cannot close the remaining gates.
+
+Full suites after the cache change: Python 3.12 **40 passed**; Python 3.13
+**39 passed, 1 skipped** because that build lacks `_xxsubinterpreters`. Export
+stress reached 2,048 stacks and 6,143 frames on each version. Fixed native
+storage was 13,770,880 bytes, with an additional bounded 1 MiB retained
+metadata budget. Additional Python export peak was 1,924,490 bytes on 3.12 and
+1,924,666 bytes on 3.13; native export took about 5.4 and 5.3 ms respectively.
+
+The current 3.13 build uploaded CPU profile `0dad275a41af43b2` and HEAP_ALLOC
+profile `53c8239abb9508a5` in project `kiloclaw-493fed13`, service
+`heap-sampler-live-20260923-221428-9b607590`. The API returned both profiles
+with positive workload attribution, the expected schemas and sampling periods,
+and resolved stack/value digests identical to the local profiles. This verifies
+the integration path, not the open performance gates.
