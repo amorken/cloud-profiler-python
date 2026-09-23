@@ -21,6 +21,8 @@ bool SafeCopy(void* dst, const void* src, size_t n);
  * Populates the CallFrame array with at-most kMaxFramesToCapture python frames
  * from the provided PyThreadState. Returns the number of frames populated.
  */
-int PopulateFrames(CallFrame* frames, PyThreadState* ts);
+int PopulateFrames(CallFrame* frames, PyThreadState* ts,
+                   int max_visited = kMaxFramesToCapture,
+                   bool* truncated = nullptr);
 
 #endif  // THIRD_PARTY_PY_GOOGLECLOUDPROFILER_SRC_POPULATE_FRAMES_H_

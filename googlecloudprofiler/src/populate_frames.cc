@@ -83,7 +83,9 @@ static bool FrameIsIncomplete(const _PyInterpreterFrame *fr, PyCodeObject *code,
   return fr->instr_ptr < _PyCode_CODE(code) + code_copy->_co_firsttraceable;
 }
 
-int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
+int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
+                   bool *truncated) {
+  if (truncated != nullptr) *truncated = false;
   if (ts == nullptr) {
     frames[0].lineno = kNoPyState;
     frames[0].py_code = nullptr;
@@ -92,7 +94,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
 
   _PyInterpreterFrame *faddr = ts->current_frame;
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int visited = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         visited < max_visited) {
+    visited++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -109,6 +114,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
       num_frames++;
     }
     faddr = fr.previous;
+  }
+  if (truncated != nullptr && faddr != nullptr &&
+      (visited >= max_visited || num_frames >= kMaxFramesToCapture)) {
+    *truncated = true;
   }
   return num_frames;
 }
@@ -153,7 +162,9 @@ static bool FrameIsIncomplete(const _PyInterpreterFrame *fr) {
   return fr->prev_instr < _PyCode_CODE(fr->f_code) + code._co_firsttraceable;
 }
 
-int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
+int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
+                   bool *truncated) {
+  if (truncated != nullptr) *truncated = false;
   if (ts == nullptr) {
     frames[0].lineno = kNoPyState;
     frames[0].py_code = nullptr;
@@ -174,7 +185,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
   }
 
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int visited = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         visited < max_visited) {
+    visited++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -189,6 +203,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
       num_frames++;
     }
     faddr = fr.previous;
+  }
+  if (truncated != nullptr && faddr != nullptr &&
+      (visited >= max_visited || num_frames >= kMaxFramesToCapture)) {
+    *truncated = true;
   }
   return num_frames;
 }
@@ -227,7 +245,9 @@ static bool FrameIsIncomplete(const _PyInterpreterFrame *fr) {
   return fr->prev_instr < _PyCode_CODE(fr->f_code) + code._co_firsttraceable;
 }
 
-int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
+int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
+                   bool *truncated) {
+  if (truncated != nullptr) *truncated = false;
   if (ts == nullptr) {
     frames[0].lineno = kNoPyState;
     frames[0].py_code = nullptr;
@@ -248,7 +268,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
   }
 
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int visited = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         visited < max_visited) {
+    visited++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -264,13 +287,19 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
     }
     faddr = fr.previous;
   }
+  if (truncated != nullptr && faddr != nullptr &&
+      (visited >= max_visited || num_frames >= kMaxFramesToCapture)) {
+    *truncated = true;
+  }
   return num_frames;
 }
 
 #else
 // python versions before 3.11
 
-int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
+int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
+                   bool *truncated) {
+  if (truncated != nullptr) *truncated = false;
   if (ts == nullptr) {
     frames[0].lineno = kNoPyState;
     frames[0].py_code = nullptr;
@@ -280,11 +309,18 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
   // so the frame object for the current thread is stable.
   PyFrameObject *frame = ts->frame;
   int num_frames = 0;
-  while (frame != nullptr && num_frames < kMaxFramesToCapture) {
+  int visited = 0;
+  while (frame != nullptr && num_frames < kMaxFramesToCapture &&
+         visited < max_visited) {
+    visited++;
     frames[num_frames].lineno = frame->f_lineno;
     frames[num_frames].py_code = frame->f_code;
     num_frames++;
     frame = frame->f_back;
+  }
+  if (truncated != nullptr && frame != nullptr &&
+      (visited >= max_visited || num_frames >= kMaxFramesToCapture)) {
+    *truncated = true;
   }
   return num_frames;
 }
