@@ -104,10 +104,11 @@ def _run_threads(batches, operations_per_batch):
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('mode', choices=('baseline', 'idle', 'active'))
-  parser.add_argument('--interval-bytes', type=int, default=524288)
+  parser.add_argument('--interval-bytes', type=int, default=4194304)
   parser.add_argument('--batches', type=int, default=200)
   parser.add_argument('--operations-per-batch', type=int, default=1000)
-  parser.add_argument('--case', choices=('all', 'small', 'varied', 'deep'),
+  parser.add_argument('--case',
+                      choices=('all', 'small', 'varied', 'deep', 'threads'),
                       default='all')
   args = parser.parse_args()
   if min(args.interval_bytes, args.batches, args.operations_per_batch) <= 0:
@@ -117,7 +118,12 @@ def main():
     if not _profiler._memory_initialize(args.interval_bytes):
       raise RuntimeError('native allocation profiling is unavailable')
 
-  kinds = ('small', 'varied', 'deep') if args.case == 'all' else (args.case,)
+  if args.case == 'all':
+    kinds = ('small', 'varied', 'deep')
+  elif args.case == 'threads':
+    kinds = ()
+  else:
+    kinds = (args.case,)
   # Warm the Python call paths before timing them.
   for kind in kinds:
     for index in range(3000):
@@ -132,7 +138,7 @@ def main():
       kind: _run_case(kind, args.batches, args.operations_per_batch)
       for kind in kinds
   }
-  if args.case == 'all':
+  if args.case in ('all', 'threads'):
     results['threads_4x'] = _run_threads(args.batches,
                                          args.operations_per_batch)
   if args.mode == 'active':
@@ -141,6 +147,7 @@ def main():
     results['estimated_objects'] = sum(values[0] for values in traces.values())
     results['trace_count'] = len(traces)
     results['selected_samples'] = diagnostics['selected_samples']
+    results['attributed_objects'] = diagnostics['attributed_objects']
     results['unknown_objects'] = diagnostics['unknown_objects']
     results['overflow_objects'] = diagnostics['overflow_objects']
     results['export_duration_ns'] = diagnostics['export_duration_ns']
