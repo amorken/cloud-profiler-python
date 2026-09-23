@@ -17,8 +17,13 @@ import subprocess
 import sys
 import tempfile
 
+if __package__:
+  from .build_memory_variant import MANIFEST_NAME, digest_file, source_digest
+else:
+  from build_memory_variant import MANIFEST_NAME, digest_file, source_digest
 
-CASES = ('small', 'varied', 'deep', 'threads')
+
+CASES = ('small', 'varied', 'deep', 'repeated', 'threads1', 'threads')
 MODES = ('baseline', 'idle', 'active')
 
 
@@ -27,7 +32,7 @@ def under_root(path, root):
 
 
 def run_case(root, worker, kind, mode, batches, operations_per_batch,
-             interval_bytes):
+             interval_bytes, extension):
   environment = os.environ.copy()
   environment['PYTHONPATH'] = str(root)
   command = [sys.executable, str(worker), mode, '--case', kind,
@@ -37,16 +42,30 @@ def run_case(root, worker, kind, mode, batches, operations_per_batch,
   result = json.loads(subprocess.run(
       command, cwd=root, env=environment, check=True, capture_output=True,
       text=True).stdout)
-  if not under_root(result['extension_path'], root):
-    raise RuntimeError('benchmark imported an extension outside ' + str(root))
+  if Path(result['extension_path']) != extension:
+    raise RuntimeError('benchmark imported an extension other than the build')
   if result['diagnostic_stage'] != 4:
     raise RuntimeError('diagnostic extension is not a qualification build')
   if mode == 'active' and (not result['selected_samples'] or
                            not result['attributed_objects']):
     raise RuntimeError('active run lacks attributed native samples')
-  key = 'threads_4x' if kind == 'threads' else kind
+  key = {'threads': 'threads_4x', 'threads1': 'threads_1x'}.get(kind, kind)
   return result[key], (result.get('selected_samples', 0),
                        result.get('attributed_objects', 0))
+
+
+def load_manifest(root):
+  manifest = json.loads((root / MANIFEST_NAME).read_text())
+  if manifest['python'] != str(Path(sys.executable).resolve()):
+    raise RuntimeError('build and benchmark Python interpreters differ')
+  if manifest['source_sha256'] != source_digest(root):
+    raise RuntimeError('native sources changed after the recorded build')
+  extension = (root / manifest['extension']).resolve()
+  if not under_root(extension, root) or not extension.is_file():
+    raise RuntimeError('recorded extension is missing or outside the build')
+  if manifest['extension_sha256'] != digest_file(extension):
+    raise RuntimeError('extension changed after the recorded build')
+  return manifest
 
 
 def percentile(values, proportion):
@@ -85,6 +104,11 @@ def main():
       ('candidate', args.candidate_root))}
   if roots['reference'] == roots['candidate']:
     parser.error('reference and candidate trees must differ')
+  manifests = {name: load_manifest(root) for name, root in roots.items()}
+  extensions = {name: (roots[name] / manifests[name]['extension']).resolve()
+                for name in roots}
+  if manifests['reference']['commands'] != manifests['candidate']['commands']:
+    parser.error('native compiler and linker flags differ between builds')
   if args.cpu is not None:
     if args.cpu not in os.sched_getaffinity(0):
       parser.error('--cpu is outside the allowed affinity set')
@@ -97,7 +121,8 @@ def main():
   for case in CASES:
     calibration, unused = run_case(
         roots['reference'], worker, case, 'baseline', 1000,
-        args.operations_per_batch, args.interval_bytes)
+        args.operations_per_batch, args.interval_bytes,
+        extensions['reference'])
     batches = max(1000, math.ceil(1000 * args.target_seconds /
                                   calibration['seconds']))
     rows = []
@@ -109,7 +134,8 @@ def main():
       for tree, mode in order:
         measured, diagnostics = run_case(
             roots[tree], worker, case, mode, batches,
-            args.operations_per_batch, args.interval_bytes)
+            args.operations_per_batch, args.interval_bytes,
+            extensions[tree])
         results[(tree, mode)] = dict(measured, diagnostics=diagnostics)
       reference_baseline = results[('reference', 'baseline')]
       candidate_baseline = results[('candidate', 'baseline')]
@@ -133,7 +159,7 @@ def main():
               reference_active['batch_p99_ms'] - 1),
       })
       if args.output:
-        write_results(args.output, args, roots, measurements)
+        write_results(args.output, args, roots, manifests, measurements)
     fields = ('reference_active_loss_percent',
               'candidate_active_loss_percent', 'candidate_idle_loss_percent',
               'candidate_active_p99_change_percent')
@@ -149,11 +175,12 @@ def main():
       }
     measurements[case]['summary'] = summary
     if args.output:
-      write_results(args.output, args, roots, measurements)
-  print(json.dumps(report(args, roots, measurements), indent=2, sort_keys=True))
+      write_results(args.output, args, roots, manifests, measurements)
+  print(json.dumps(report(args, roots, manifests, measurements), indent=2,
+                   sort_keys=True))
 
 
-def report(args, roots, measurements):
+def report(args, roots, manifests, measurements):
   return {
       'reference_root': str(roots['reference']),
       'candidate_root': str(roots['candidate']),
@@ -163,16 +190,17 @@ def report(args, roots, measurements):
       'repeats': args.repeats,
       'target_seconds': args.target_seconds,
       'seed': args.seed,
+      'builds': manifests,
       'cases': measurements,
   }
 
 
-def write_results(path, args, roots, measurements):
+def write_results(path, args, roots, manifests, measurements):
   path = path.resolve()
   with tempfile.NamedTemporaryFile(
       mode='w', dir=path.parent, prefix=path.name + '.',
       delete=False) as output:
-    json.dump(report(args, roots, measurements), output, indent=2,
+    json.dump(report(args, roots, manifests, measurements), output, indent=2,
               sort_keys=True)
     temporary = output.name
   os.replace(temporary, path)

@@ -46,8 +46,8 @@ def _operation(kind, index):
     _small_allocation(index)
   elif kind == 'varied':
     _varied_allocation(index)
-  elif kind == 'deep':
-    _deep_allocation(32, index)
+  elif kind in ('deep', 'repeated'):
+    _deep_allocation(32 if kind == 'deep' else 8, index)
   else:
     value = bytearray(128)
     value[0] = index & 255
@@ -75,7 +75,7 @@ def _run_case(kind, batches, operations_per_batch):
   }
 
 
-def _run_threads(batches, operations_per_batch):
+def _run_threads(batches, operations_per_batch, count):
   latencies = []
 
   def worker():
@@ -89,7 +89,7 @@ def _run_threads(batches, operations_per_batch):
     latencies.extend(worker_latencies)
 
   started = time.perf_counter()
-  workers = [threading.Thread(target=worker) for _ in range(4)]
+  workers = [threading.Thread(target=worker) for _ in range(count)]
   for thread in workers:
     thread.start()
   for thread in workers:
@@ -97,7 +97,7 @@ def _run_threads(batches, operations_per_batch):
   elapsed = time.perf_counter() - started
   return {
       'seconds': elapsed,
-      'ops_per_second': 4 * batches * operations_per_batch / elapsed,
+      'ops_per_second': count * batches * operations_per_batch / elapsed,
       'batch_p99_ms': _percentile_99(latencies),
   }
 
@@ -109,7 +109,8 @@ def main():
   parser.add_argument('--batches', type=int, default=200)
   parser.add_argument('--operations-per-batch', type=int, default=1000)
   parser.add_argument('--case',
-                      choices=('all', 'small', 'varied', 'deep', 'threads'),
+                      choices=('all', 'small', 'varied', 'deep', 'repeated',
+                               'threads1', 'threads'),
                       default='all')
   args = parser.parse_args()
   if min(args.interval_bytes, args.batches, args.operations_per_batch) <= 0:
@@ -120,8 +121,8 @@ def main():
       raise RuntimeError('native allocation profiling is unavailable')
 
   if args.case == 'all':
-    kinds = ('small', 'varied', 'deep')
-  elif args.case == 'threads':
+    kinds = ('small', 'varied', 'deep', 'repeated')
+  elif args.case in ('threads', 'threads1'):
     kinds = ()
   else:
     kinds = (args.case,)
@@ -142,9 +143,12 @@ def main():
   results['extension_path'] = os.path.realpath(_profiler.__file__)
   results['diagnostic_stage'] = getattr(
       _profiler, '_memory_diagnostic_stage', lambda: 4)()
+  if args.case in ('all', 'threads1'):
+    results['threads_1x'] = _run_threads(args.batches,
+                                         args.operations_per_batch, 1)
   if args.case in ('all', 'threads'):
     results['threads_4x'] = _run_threads(args.batches,
-                                         args.operations_per_batch)
+                                         args.operations_per_batch, 4)
   if args.mode == 'active':
     traces, unused_duration, unused_start, diagnostics = (
         _profiler._memory_stop())

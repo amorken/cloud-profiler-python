@@ -525,3 +525,27 @@ digests for CPU profile `51e609a4d335cdd2` and HEAP_ALLOC profile
 `5704f51b4b6822d6`. The latter had positive workload-attributed samples and
 the expected 4 MiB period. This confirms end-to-end behavior, not the open
 throughput gates.
+
+## Runtime overhead follow-up (2026-09-23)
+
+- [x] Record matched native compiler/linker commands, source hashes, extension
+  hashes, and interpreter identity for reference and candidate builds. The
+  paired runner rejects stale or mismatched builds and checks the exact loaded
+  extension.
+- [x] Add one- and four-worker versions of the same allocation loop and a
+  repeated eight-frame stack workload. Keep the depth-32 workload for the
+  deeper walker case.
+- [x] Review the measurement harness and run an identical-source smoke
+  comparison with real stack attribution on Python 3.12. Both sides used the
+  same production flags, including frame pointers and stack protection. Short
+  two-pair measurements varied substantially and are not gate evidence.
+- [ ] Move first-use countdown initialization and high-word arithmetic out of
+  the common callback, then test and measure a matched build.
+- [ ] Add a GIL-held synchronous frame walker for allocation samples on 3.12
+  and 3.13, retaining the signal-safe walker for CPU signals and other versions.
+- [ ] Add bounded collection-local resolved metadata reuse without retaining
+  code objects or changing attribution on cache miss or exhaustion.
+- [ ] Document an allocator hook-switching feasibility decision from CPython
+  source without changing hook installation in this iteration.
+- [ ] Run full tests, export stress, and matched ten-pair throughput and p99
+  qualification on 3.12 and 3.13; repeat real Cloud Profiler API readback.
