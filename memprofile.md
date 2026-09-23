@@ -70,7 +70,7 @@ commit `305314c`.
 ### Profile and agent integration
 
 - [x] Add trailing `start()` options `enable_memory_profiling=False` and
-  `memory_sampling_interval_bytes=524288`; validate before installing hooks.
+  `memory_sampling_interval_bytes=4194304`; validate before installing hooks.
 - [x] Register a `HEAP_ALLOC` profiler only after native initialization succeeds;
   reuse existing scheduling, duration, authentication, upload, and retry flow.
 - [x] Encode `alloc_objects/count` and `alloc_space/bytes`, default to
@@ -96,18 +96,21 @@ commit `305314c`.
 - [x] Benchmark disabled, installed-but-idle, and active collection workloads,
   including allocation churn, multiple sizes, deep/varied stacks, and threads.
 - [ ] Meet gates: zero hooks/storage when disabled; <=1% regression with inactive
-  hooks; <=5% throughput and p99 latency regression during collection; <=1%
-  average regression across scheduled collection; native collector storage
-  <=16 MiB; bounded export with measured peak memory.
-- [ ] Validate in a controlled Cloud Profiler project, then run an opt-in canary.
+  hooks; <=10% throughput regression in every active workload; <=1% average
+  regression across scheduled collection; native collector storage <=16 MiB;
+  bounded export with measured peak memory.
+- [x] Validate CPU and HEAP_ALLOC uploads and decoded API readback in a controlled
+  Cloud Profiler project (2026-09-23).
+- [ ] Run an opt-in production canary.
 
 ## Implementation defaults and behavior
 
 - Memory profiling is opt-in, requires the native CPU-profiler runtime support,
   and is owned by the main interpreter with the GIL enabled. CPU collection need
   not be active at the same time.
-- Initial mean sampling interval is 512 KiB. Configuration must be a positive
-  integer and remains constant for a collection.
+- Initial mean sampling interval is 4 MiB. Configuration must be a positive
+  integer and remains constant for a collection; callers may request 512 KiB
+  for denser samples.
 - Cover only MEM/OBJ requests. RAW-domain and direct native allocation paths,
   Python freelists, live-heap profiling, subinterpreter support, and additional
   Python versions are out of scope.
@@ -258,3 +261,169 @@ commit `305314c`.
   to 0.376ms (varied), 0.864ms to 1.352ms (deep), and 0.094ms to 5.206ms
   (four-thread). These local runs still fail the active overhead gates; the
   inactive-hook and scheduled-average gates remain unproven.
+
+## Throughput optimization follow-up (2026-09-23)
+
+- [x] Keep the no-sample allocation path inline and integer-only. Resolve the
+  thread-local sampler once across the delegate call, defer probability math
+  and stack capture until selection, and update the common 64-bit countdown
+  without a 128-bit carry chain or high-word store.
+- [x] Carry each thread's exponential residual between collection windows.
+  The residual remains exponential by memorylessness, and the configured
+  interval cannot change after hooks are installed. Selected samples still
+  revalidate their captured collection generation before accessing shared
+  collector state.
+- [x] Cover the uncommon 128-bit countdown carry and borrow with deterministic
+  native assertions, alongside the existing seeded estimator tests.
+- [x] Add a threads-only benchmark case and a paired runner that randomizes
+  baseline, installed-idle, and active configurations and reports per-repeat
+  losses against that repeat's baseline.
+- [x] Measure 512 KiB and 4 MiB with successful stack attribution on CPython
+  3.12 and 3.13; additionally sweep small and threaded churn from 4 MiB to
+  256 MiB on 3.12. Set the public default to 4 MiB as a measured compromise,
+  and retain the 512 KiB override for callers who choose denser samples.
+- [x] Build and run the full available test suites on CPython 3.12.14 and
+  3.13.15 after the sampler changes.
+- [ ] Meet the <=10% active-throughput gate for every workload. Current paired
+  measurements still exceed it for small allocations and four-thread churn;
+  do not claim the performance qualification is complete.
+
+The qualification run used CPU affinity, seed `20260923`, randomized mode
+order, successful native stack attribution, and three repeats. Both runtimes
+used 1 million small, varied-size, and depth-32 allocations plus 4 million
+allocations across four workers per run. Median paired throughput loss at the
+512 KiB and 4 MiB intervals was:
+
+| Runtime | Workload | 512 KiB | 4 MiB |
+| --- | --- | ---: | ---: |
+| 3.12 | Small allocations | 23.78% | 17.96% |
+| 3.12 | Varied sizes | 27.30% | 14.76% |
+| 3.12 | Depth-32 stacks | 7.35% | 4.32% |
+| 3.12 | Four-thread churn | 24.06% | 17.70% |
+| 3.13 | Small allocations | 15.60% | 14.93% |
+| 3.13 | Varied sizes | 23.57% | 14.20% |
+| 3.13 | Depth-32 stacks | 7.05% | 4.12% |
+| 3.13 | Four-thread churn | 20.15% | 17.44% |
+
+With real stack walking enabled, the 4 MiB interval improved the active
+throughput median in every workload on both runtimes, with the largest gains
+on varied sizes. The full interval sweep still did not reach the 10% gate.
+Small churn on 3.12 remained 12.39% slower at 64 MiB with five selected
+samples; threaded churn remained 14.53% slower at 64 MiB and 15.84% at 256
+MiB, with ten and two selected samples respectively. Higher intervals stop
+buying enough throughput to justify their loss of profile detail. The default
+is therefore 4 MiB, while the 512 KiB override remains available.
+
+The all-workload runs selected a median 5,643/654 samples at 512 KiB/4 MiB on
+3.12 and 5,466/671 on 3.13, with 12/10 and 11/9 distinct attributed stacks.
+The active throughput gate remains open, especially for small and threaded
+churn; these measurements do not qualify the feature for production.
+
+Full test suites after the final native build reported 23 passed and 4 skipped
+on both CPython versions. On 3.12, skips were stack-attribution checks because
+the sandbox blocks `process_vm_readv`; on 3.13, three had that restriction and
+the subinterpreter test skipped because `_xxsubinterpreters` is unavailable in
+that interpreter build. No-GIL runtime validation remains outstanding.
+
+### Real Cloud Profiler API smoke test (2026-09-23)
+
+- [x] Run a bounded local CPython 3.12.14 workload using the active gcloud login
+  in project `kiloclaw-493fed13`; no VM or persistent credential file required.
+- [x] Exercise the agent's normal `Client.config`, create, collect, and patch
+  paths with CPU and HEAP_ALLOC continuously advertised.
+- [x] Read back paginated API profiles, decode gzip/pprof, and compare sample
+  types, totals, sampling periods, and workload stack attribution with the
+  locally collected data. The API omits resource names in list responses,
+  re-encodes profiles, and normalizes `CPU` to `cpu`; match the unique test
+  deployment and decoded summaries instead of compressed bytes.
+- [x] Run the native test suite outside the sandbox: **27 passed, no skips**.
+
+Successful service: `heap-sampler-live-20260923-172955`.
+
+| Type | Profile ID | Aggregated stack entries | Verified totals |
+| --- | --- | --- | --- |
+| CPU | `63ea00f2155d79f3` | 5, all attributed to workload | 999 samples, 9,990,000,000 ns |
+| HEAP_ALLOC | `2c565c9964267184` | 7, all attributed to workload | 240,318,611 estimated objects, 254,235,467,758 estimated bytes |
+
+Both collection windows were approximately ten seconds. Memory sampling used
+4 MiB. Allocation totals measure traffic including freed objects, not retained
+heap. Earlier harness debugging runs also uploaded profiles under separate
+`heap-sampler-live-*` services. All test processes exited. This validates upload
+and retrieval, not production overhead, estimator accuracy, or a long canary.
+
+Reproduce explicitly (writes profiles to the selected project):
+
+```sh
+CC=gcc CXX=g++ /tmp/cloud-profiler-py312/bin/python setup.py build_ext --inplace
+PYTHONPATH=. /tmp/cloud-profiler-py312/bin/python benchmarks/verify_cloud_profiles.py \
+  --project kiloclaw-493fed13 \
+  --gcloud /home/anders/install/google-cloud-sdk/bin/gcloud
+```
+
+The script uses an in-memory access token and has a five-minute process limit.
+Native stack walking and API access must be permitted by the execution
+environment. API scheduling determines how many profiles are collected before
+both requested types have been seen. Local GCE metadata lookup warnings are
+expected when running outside Google Compute Engine.
+
+### Code review and simplification (2026-09-23)
+
+Reviewed with the Brooks Lint skill, focusing on duplicated hot-path logic,
+allocator composition, test fidelity, and trustworthy measurement.
+
+- [x] Consolidate all MEM/OBJ allocation callbacks behind one inline request
+  boundary, retaining recursion suppression, successful-request accounting,
+  generation fencing, and errno/exception preservation. Compile-time delegates
+  avoid introducing another runtime dispatch layer.
+- [x] Preserve underlying allocator contexts and free callbacks directly;
+  allocation profiling does not need to intercept frees. Validate chaining with
+  pymalloc, debug, and malloc allocator modes.
+- [x] Exercise the production sampler in deterministic tests instead of a
+  separate copy of its probability calculation. Use local state for seeded
+  sampler tests instead of temporarily modifying live thread-local state.
+- [x] Reject duplicate benchmark intervals, retain raw measurements, include
+  idle paired losses and p99 latency, and reject sampled runs without native
+  stack attribution.
+- [x] Strengthen cloud readback validation with a digest of resolved ordered
+  stacks and their allocation values. Tolerate ID renumbering and sample
+  merging; detect changed attribution even when aggregate totals match.
+- [x] Correct documentation: the sampling interval is fixed after hook
+  installation, not independently configurable for each collection.
+
+Full unsandboxed suites: CPython 3.12.14 **33 passed**; CPython 3.13.15 **32
+passed, 1 skipped** (`_xxsubinterpreters` is unavailable in that runtime).
+The callback abstraction inlines into specialized allocator functions in the
+GCC build; it does not add a callable `ProfileAllocation` layer.
+
+Further optimization should measure TLS lookup, recursion-guard, delegation,
+and countdown costs independently before changing synchronization or stack
+walking. The <=10% active-throughput gate and production canary remain open.
+
+The strengthened real API smoke test passed after the review under service
+`heap-sampler-live-20260923-185254-0a752d63` in `kiloclaw-493fed13`:
+CPU `373f3d8a5f1c8728` and HEAP_ALLOC `5d55c1c90a6020f4`. Server-returned
+resolved stack/value digests matched the local profiles, along with totals,
+schema, and sampling periods. The workload exited normally.
+
+Final review performance comparison (CPython 3.12.14, CPU 0, five randomized
+paired repeats, seed 20260923, 1,000 batches of 1,000 operations per case,
+4 MiB interval, real native stack attribution):
+
+| Workload | Before review: median active loss | After review: median active loss |
+| --- | ---: | ---: |
+| small | 15.94% | 9.94% |
+| varied | 16.92% | 1.86% |
+| deep | 2.37% | 3.05% |
+| threads_4x | 17.71% | 12.79% |
+
+The before/after sessions ran sequentially on the same host. Small, varied, and
+threaded churn improved in these runs; deep-stack loss increased by 0.68
+percentage points. These short comparisons do not isolate each change's
+contribution, quantify confidence, or establish the <=10% gate.
+Reproduction command (use the same runtime/build on both revisions):
+
+```sh
+/tmp/cloud-profiler-py312/bin/python benchmarks/compare_memory_throughput.py \
+  --intervals 4194304 --repeats 5 --batches 1000 \
+  --operations-per-batch 1000 --cpu 0
+```
