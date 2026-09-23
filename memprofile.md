@@ -561,7 +561,27 @@ throughput gates.
   statically bounded below 16 MiB. Python 3.12 full suite: 40 passed; Python
   3.13: 39 passed, one unavailable-subinterpreter skip. A short three-pair
   performance screen remains too noisy for qualification.
-- [ ] Document an allocator hook-switching feasibility decision from CPython
+- [x] Document an allocator hook-switching feasibility decision from CPython
   source without changing hook installation in this iteration.
 - [ ] Run full tests, export stress, and matched ten-pair throughput and p99
   qualification on 3.12 and 3.13; repeat real Cloud Profiler API readback.
+
+### Allocator hook-switching feasibility
+
+CPython 3.13's [`tracemalloc` stop path](https://raw.githubusercontent.com/python/cpython/v3.13.0/Python/tracemalloc.c)
+restores its previous MEM/OBJ allocators, so periodic removal is possible in
+that implementation. It is not a general safety guarantee for an independently
+loaded agent. [`PyMem_SetAllocator` is documented](https://docs.python.org/3.13/c-api/memory.html#c.PyMem_SetAllocator)
+as requiring a wrapper after runtime initialization, and the MEM/OBJ domains
+must be thread-safe. In [CPython's allocator implementation](https://raw.githubusercontent.com/python/cpython/v3.13.0/Objects/obmalloc.c),
+Get/Set use an allocator mutex, while allocation calls read function and
+context fields without that mutex; the source explicitly acknowledges a race
+when the allocator changes during a call. The main interpreter's GIL does not
+stop independent interpreters from using the same process-global allocator.
+
+Consequently this agent retains its process-lifetime pass-through wrappers.
+An opt-in switching experiment would need a demonstrated process-wide
+quiescence protocol, interoperable chaining with tracemalloc/debug/third-party
+hooks, and adversarial allocator replacement and fork tests across the full
+supported runtime matrix. Agent-only `PyMem_SetAllocator` calls at every
+profile boundary are not qualified as a production optimization.
