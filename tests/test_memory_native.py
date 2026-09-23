@@ -40,6 +40,10 @@ def test_poisson_probability_and_estimator_weights():
   assert (objects, byte_estimate) == (1.0, 1000000.0)
 
 
+def test_128_bit_countdown_carries_and_borrows():
+  assert _profiler._memory_test_countdown()
+
+
 def test_memory_hooks_and_storage_are_absent_until_opted_in():
   source = r'''
 from googlecloudprofiler import _profiler
@@ -92,6 +96,7 @@ assert _profiler._memory_available()
 assert _profiler._memory_test_allocator_calls() == (
     True, True, True, True, True, True, True, True)
 assert _profiler._memory_test_callback_state() == (True, True)
+assert _profiler._memory_test_fast_callback_state() == (True, True, True)
 assert _profiler._memory_test_nested_hook()
 traces, duration_ns, start_time_ns, diagnostics = _profiler._memory_stop()
 assert duration_ns >= 0
@@ -120,6 +125,37 @@ def test_allocator_wrappers_chain_under_debug_allocator():
   _run_allocator_process(debug_allocator=True)
 
 
+@pytest.mark.parametrize('allocator', ['pymalloc', 'debug', 'malloc'])
+def test_free_delegation_preserves_allocator_context(allocator):
+  source = r'''
+import ctypes
+from googlecloudprofiler import _profiler
+
+class Allocator(ctypes.Structure):
+  _fields_ = [(field, ctypes.c_void_p)
+              for field in ('ctx', 'malloc', 'calloc', 'realloc', 'free')]
+
+get_allocator = ctypes.pythonapi.PyMem_GetAllocator
+get_allocator.argtypes = (ctypes.c_int, ctypes.POINTER(Allocator))
+get_allocator.restype = None
+before = [Allocator(), Allocator()]
+for domain, value in enumerate(before, start=1):
+  get_allocator(domain, ctypes.byref(value))
+assert _profiler._memory_initialize(1)
+for domain, original in enumerate(before, start=1):
+  wrapped = Allocator()
+  get_allocator(domain, ctypes.byref(wrapped))
+  assert wrapped.ctx == original.ctx
+  assert wrapped.free == original.free
+  assert wrapped.malloc != original.malloc
+assert _profiler._memory_start()
+assert all(_profiler._memory_test_allocator_calls())
+_profiler._memory_stop()
+'''
+  environment = dict(os.environ, PYTHONMALLOC=allocator)
+  subprocess.run([sys.executable, '-c', source], check=True, env=environment)
+
+
 def test_allocator_replacement_disables_future_memory_profiles():
   source = r'''
 from googlecloudprofiler import _profiler
@@ -136,6 +172,47 @@ assert not _profiler._memory_available()
 assert not _profiler._memory_start()
 '''
   subprocess.run([sys.executable, '-c', source], check=True)
+
+
+def test_subinterpreter_allocations_are_excluded_from_main_profile():
+  pytest.importorskip('_xxsubinterpreters')
+  source = r'''
+import json
+import _xxsubinterpreters as interpreters
+from googlecloudprofiler import _profiler
+
+assert _profiler._memory_initialize(1)
+assert _profiler._memory_start()
+subinterpreter = interpreters.create()
+interpreters.run_string(subinterpreter, r"""
+foreign_source = (
+    'def subinterpreter_only():\n'
+    '  for unused_index in range(1000):\n'
+    '    bytearray(64)\n'
+    'subinterpreter_only()\n')
+exec(compile(foreign_source, 'subinterpreter_only.py', 'exec'))
+""")
+interpreters.destroy(subinterpreter)
+traces, duration, start, diagnostics = _profiler._memory_stop()
+frames = [frame for trace in traces for frame in trace]
+if not diagnostics['attributed_objects']:
+    print(json.dumps({'attributed': False}))
+else:
+    print(json.dumps({
+        'attributed': True,
+        'foreign_frame': any(
+            filename == 'subinterpreter_only.py'
+            for unused_name, filename, unused_line in frames),
+    }))
+'''
+  result = subprocess.run([sys.executable, '-c', source], check=True,
+                          capture_output=True, text=True,
+                          env=os.environ.copy())
+  report = json.loads(result.stdout)
+  if not report['attributed']:
+    pytest.skip(
+        'process_vm_readv is blocked, so native frame attribution is unavailable')
+  assert not report['foreign_frame']
 
 
 def test_fork_child_inherits_inactive_collection():

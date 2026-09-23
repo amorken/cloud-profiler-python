@@ -107,8 +107,8 @@ bool g_hooks_installed = false;
 std::atomic<bool> g_hooks_disabled(false);
 bool g_after_fork = false;
 // A nonzero collection generation also means collection is active. Wrappers
-// read this once per allocation and pass it to the TLS sampler, avoiding a
-// second atomic generation load on the hot path.
+// snapshot it once per allocation; selected samples recheck it before touching
+// the collector so work cannot cross a collection boundary.
 std::atomic<uint64_t> g_active_generation(0);
 uint64_t g_next_generation = 1;
 std::atomic<uint64_t> g_seed(0x4d595df4d0f33173ULL);
@@ -117,71 +117,53 @@ int64_t g_collection_start_wall_ns = 0;
 
 struct ThreadSampler {
   bool in_hook;
-  uint64_t generation;
+  uint64_t interval;
   uint64_t rng;
   typedef unsigned __int128 Countdown;
-  Countdown countdown;
-  ThreadSampler()
-      : in_hook(false), generation(0), rng(0), countdown(0.0) {}
+  uint64_t countdown_low;
+  uint64_t countdown_high;
 };
 
 typedef ThreadSampler::Countdown Countdown;
 
-thread_local ThreadSampler g_thread_sampler;
+// This is deliberately a trivial zero-initialized TLS object. A constructor
+// here makes compilers emit a per-thread initialization guard on every access
+// from the allocator hooks.
+thread_local ThreadSampler g_thread_sampler = {};
 
-struct SampleResult {
-  bool selected;
-  long double probability;
-};
+inline ThreadSampler *CurrentThreadSampler() { return &g_thread_sampler; }
 
-SampleResult EvaluateRequest(size_t requested_size, uint64_t interval,
-                             Countdown *countdown) {
-  const uint64_t effective_size =
-      requested_size == 0 ? 1 : static_cast<uint64_t>(requested_size);
-  SampleResult result;
-  result.selected = *countdown <= static_cast<Countdown>(effective_size);
-  result.probability = result.selected
-                           ? -std::expm1(-static_cast<long double>(effective_size) /
-                                        static_cast<long double>(interval))
-                           : 0.0L;
-  if (result.selected) {
-    // The caller draws a new exponential countdown at the request end. A
-    // request that spans several events is still recorded only once.
-    *countdown = 0;
-  } else {
-    *countdown -= static_cast<Countdown>(effective_size);
-  }
-  return result;
-}
-
-uint64_t NextRandom() {
-  if (g_thread_sampler.rng == 0) {
+uint64_t NextRandom(ThreadSampler *sampler) {
+  if (sampler->rng == 0) {
     uint64_t seed = g_seed.fetch_add(0x9e3779b97f4a7c15ULL,
                                      std::memory_order_relaxed);
     // Mix a per-thread sequence value without asking the runtime for a thread
     // identifier, which can call into platform libraries from the hook.
-    seed ^= reinterpret_cast<uintptr_t>(&g_thread_sampler);
+    seed ^= reinterpret_cast<uintptr_t>(sampler);
     if (seed == 0) seed = 0x2545f4914f6cdd1dULL;
-    g_thread_sampler.rng = seed;
+    sampler->rng = seed;
   }
-  uint64_t x = g_thread_sampler.rng;
+  uint64_t x = sampler->rng;
   x ^= x >> 12;
   x ^= x << 25;
   x ^= x >> 27;
-  g_thread_sampler.rng = x;
+  sampler->rng = x;
   return x * 0x2545f4914f6cdd1dULL;
 }
 
-double UniformOpen01() {
-  // The half-unit adjustment keeps both endpoints out of the interval.
-  const uint64_t mantissa = (NextRandom() >> 11) + 1;
-  return static_cast<double>(mantissa) / 9007199254740993.0;
+double UniformOpen01(ThreadSampler *sampler) {
+  // Use an exactly representable denominator greater than every numerator.
+  // 2^53 + 1 rounds to 2^53 as a double and could therefore return 1.0.
+  const uint64_t mantissa = (NextRandom(sampler) >> 11) + 1;
+  return static_cast<double>(mantissa) / 9007199254740994.0;
 }
 
-Countdown DrawCountdown(uint64_t interval) {
+Countdown DrawCountdown(uint64_t interval, ThreadSampler *sampler) {
+  const int saved_errno = errno;
   const long double draw =
       -static_cast<long double>(interval) *
-      std::log(static_cast<long double>(UniformOpen01()));
+      std::log(static_cast<long double>(UniformOpen01(sampler)));
+  errno = saved_errno;
   const long double max_exclusive = std::ldexp(1.0L, 128);
   const Countdown max_countdown = ~static_cast<Countdown>(0);
   if (!std::isfinite(static_cast<double>(draw)) || draw >= max_exclusive) {
@@ -193,20 +175,54 @@ Countdown DrawCountdown(uint64_t interval) {
   return static_cast<Countdown>(rounded);
 }
 
-SampleResult SampleRequest(size_t requested_size, uint64_t interval,
-                           uint64_t generation) {
-  if (g_thread_sampler.generation != generation) {
-    g_thread_sampler.generation = generation;
-    g_thread_sampler.countdown = DrawCountdown(interval);
+// Keep the exponential residual across collection windows. It remains
+// exponential by memorylessness, and the configured interval is immutable.
+inline bool ConsumeCountdownBytes(uint64_t size, ThreadSampler *sampler) {
+  uint64_t countdown_low = sampler->countdown_low;
+  if (countdown_low == 0 && sampler->countdown_high == 0) {
+    // Zero is reserved for a thread that has not sampled its first allocation.
+    sampler->interval = g_sampling_interval;
+    const Countdown countdown = DrawCountdown(sampler->interval, sampler);
+    sampler->countdown_low = static_cast<uint64_t>(countdown);
+    sampler->countdown_high = static_cast<uint64_t>(countdown >> 64);
+    countdown_low = sampler->countdown_low;
   }
-  SampleResult result = EvaluateRequest(requested_size, interval,
-                                        &g_thread_sampler.countdown);
-  if (result.selected) {
-    // A request can span multiple Poisson events. It contributes at most one
-    // stack and starts a fresh countdown at its end.
-    g_thread_sampler.countdown = DrawCountdown(interval);
+  if (countdown_low > size) {
+    // The common residual fits in one word. Leave the high word untouched and
+    // avoid the carry chain required for a full 128-bit subtraction.
+    sampler->countdown_low = countdown_low - size;
+    return false;
   }
-  return result;
+  uint64_t countdown_high = sampler->countdown_high;
+  if (countdown_high != 0) {
+    const uint64_t remaining_low = countdown_low - size;
+    if (countdown_low < size) --countdown_high;
+    sampler->countdown_low = remaining_low;
+    sampler->countdown_high = countdown_high;
+    return false;
+  }
+  return true;
+}
+
+inline bool SampleRequest(size_t requested_size, ThreadSampler *sampler,
+                          long double *probability) {
+  const uint64_t effective_size =
+      requested_size == 0 ? 1 : static_cast<uint64_t>(requested_size);
+  if (!ConsumeCountdownBytes(effective_size, sampler)) return false;
+
+  // Probability math and the next countdown are uncommon. Preserve the
+  // underlying allocator's errno without adding errno traffic to misses.
+  const int saved_errno = errno;
+  *probability =
+      -std::expm1(-static_cast<long double>(effective_size) /
+                  static_cast<long double>(sampler->interval));
+  errno = saved_errno;
+  // A request spanning multiple Poisson events is recorded once, then starts
+  // a fresh countdown at the request's end.
+  const Countdown countdown = DrawCountdown(sampler->interval, sampler);
+  sampler->countdown_low = static_cast<uint64_t>(countdown);
+  sampler->countdown_high = static_cast<uint64_t>(countdown >> 64);
+  return true;
 }
 
 uint64_t HashBytes(const char *data, size_t size) {
@@ -406,21 +422,20 @@ bool FindOrAddStack(const StoredFrame *frames, int frame_count, uint64_t hash,
   return false;
 }
 
-void RecordSelectedAllocation(size_t requested_size,
-                              const SampleResult &sample,
+void RecordSelectedAllocation(size_t requested_size, long double probability,
                               PyThreadState *thread_state) {
   if (g_data != nullptr &&
       g_data->selected_samples != std::numeric_limits<uint64_t>::max()) {
     ++g_data->selected_samples;
   }
-  if (g_data == nullptr || sample.probability <= 0.0L ||
-      !std::isfinite(static_cast<double>(sample.probability))) {
+  if (g_data == nullptr || probability <= 0.0L ||
+      !std::isfinite(static_cast<double>(probability))) {
     if (g_data != nullptr) g_data->invalid_estimate = true;
     return;
   }
-  const long double objects = 1.0L / sample.probability;
+  const long double objects = 1.0L / probability;
   const long double bytes = static_cast<long double>(requested_size) /
-                            sample.probability;
+                            probability;
   if (!std::isfinite(static_cast<double>(objects)) ||
       !std::isfinite(static_cast<double>(bytes))) {
     g_data->invalid_estimate = true;
@@ -492,148 +507,121 @@ void RecordSelectedAllocation(size_t requested_size,
   }
 }
 
-void ObserveAllocation(size_t requested_size, uint64_t generation) {
-  // Do not access sampler or collector state until the current thread is known
-  // to be attached to the main interpreter with the GIL. The allocator hooks
-  // are process-wide, so they can also see calls from unsupported contexts.
-  if (g_hooks_disabled.load(std::memory_order_acquire) ||
-      !PyGILState_Check()) return;
-  PyThreadState *thread_state = PyThreadState_Get();
-  if (thread_state == nullptr) return;
+PyThreadState *CurrentThreadStateUnchecked() {
+#if PY_VERSION_HEX >= 0x030D0000
+  return PyThreadState_GetUnchecked();
+#else
+  return _PyThreadState_UncheckedGet();
+#endif
+}
+
+void ObserveSelectedAllocation(size_t requested_size, uint64_t generation,
+                               long double probability) {
+  // Probability math and countdown draws preserve errno themselves. Save the
+  // allocator's errno only for the selected path, where interpreter checks and
+  // frame attribution can call runtime or libc helpers.
+  const int saved_errno = errno;
+  if (g_hooks_disabled.load(std::memory_order_acquire)) {
+    errno = saved_errno;
+    return;
+  }
+  PyThreadState *thread_state = CurrentThreadStateUnchecked();
+  if (thread_state == nullptr) {
+    errno = saved_errno;
+    return;
+  }
 #if PY_VERSION_HEX >= 0x03090000
   PyInterpreterState *interpreter = PyThreadState_GetInterpreter(thread_state);
 #else
   PyInterpreterState *interpreter = thread_state->interp;
 #endif
-  if (interpreter != g_main_interpreter) return;
-
-  SampleResult sample = SampleRequest(requested_size, g_sampling_interval,
-                                      generation);
-  if (!sample.selected) return;
+  if (interpreter != g_main_interpreter ||
+      g_active_generation.load(std::memory_order_acquire) != generation) {
+    errno = saved_errno;
+    return;
+  }
 
   PyObject *error_type = nullptr;
   PyObject *error_value = nullptr;
   PyObject *error_traceback = nullptr;
   PyErr_Fetch(&error_type, &error_value, &error_traceback);
-  RecordSelectedAllocation(requested_size, sample, thread_state);
+  RecordSelectedAllocation(requested_size, probability, thread_state);
   PyErr_Clear();
   PyErr_Restore(error_type, error_value, error_traceback);
+  errno = saved_errno;
 }
 
-void *MemMalloc(void *context, size_t size) {
-  (void)context;
+inline void ObserveAllocationCandidate(size_t requested_size,
+                                       uint64_t generation,
+                                       ThreadSampler *sampler) {
+  // The shared per-thread Poisson stream can advance on allocations from
+  // unsupported interpreters; selected events are rejected before collector
+  // access, and restricting the stream to main-interpreter allocations keeps
+  // the same Poisson distribution.
+  long double probability;
+  if (SampleRequest(requested_size, sampler, &probability)) {
+    ObserveSelectedAllocation(requested_size, generation, probability);
+  }
+}
+
+// All MEM/OBJ operations share one outermost-request boundary. The delegate
+// is a compile-time callable so these checks inline into each allocator hook.
+template <typename Allocate>
+inline void *ProfileAllocation(size_t size, bool valid_size,
+                               const Allocate &allocate) {
   const uint64_t generation =
       g_active_generation.load(std::memory_order_acquire);
-  if (generation == 0) {
-    return g_mem_allocator.malloc(g_mem_allocator.ctx, size);
+  if (generation == 0) return allocate();
+
+  // Resolve TLS once and retain its address across the delegate call. Volatile
+  // prevents GCC from resolving TLS again after a potentially reentrant call.
+  ThreadSampler *volatile sampler = CurrentThreadSampler();
+  if (sampler->in_hook) return allocate();
+  sampler->in_hook = true;
+  void *result = allocate();
+  if (result != nullptr && valid_size) {
+    ObserveAllocationCandidate(size, generation, sampler);
   }
-  if (g_thread_sampler.in_hook) return g_mem_allocator.malloc(g_mem_allocator.ctx, size);
-  g_thread_sampler.in_hook = true;
-  void *result = g_mem_allocator.malloc(g_mem_allocator.ctx, size);
-  const int saved_errno = errno;
-  if (result != nullptr) ObserveAllocation(size, generation);
-  errno = saved_errno;
-  g_thread_sampler.in_hook = false;
+  sampler->in_hook = false;
   return result;
 }
 
-void *MemCalloc(void *context, size_t count, size_t size) {
-  (void)context;
-  const uint64_t generation =
-      g_active_generation.load(std::memory_order_acquire);
-  if (generation == 0) {
-    return g_mem_allocator.calloc(g_mem_allocator.ctx, count, size);
-  }
-  if (g_thread_sampler.in_hook) return g_mem_allocator.calloc(g_mem_allocator.ctx, count, size);
-  g_thread_sampler.in_hook = true;
-  void *result = g_mem_allocator.calloc(g_mem_allocator.ctx, count, size);
-  const int saved_errno = errno;
-  if (result != nullptr && (count == 0 || size <= SIZE_MAX / count)) {
-    ObserveAllocation(count * size, generation);
-  }
-  errno = saved_errno;
-  g_thread_sampler.in_hook = false;
-  return result;
+template <PyMemAllocatorEx *Allocator>
+void *Malloc(void *context, size_t size) {
+  return ProfileAllocation(size, true, [=]() {
+    return Allocator->malloc(context, size);
+  });
 }
 
-void *MemRealloc(void *context, void *pointer, size_t size) {
-  (void)context;
-  const uint64_t generation =
-      g_active_generation.load(std::memory_order_acquire);
-  if (generation == 0) {
-    return g_mem_allocator.realloc(g_mem_allocator.ctx, pointer, size);
-  }
-  if (g_thread_sampler.in_hook) return g_mem_allocator.realloc(g_mem_allocator.ctx, pointer, size);
-  g_thread_sampler.in_hook = true;
-  void *result = g_mem_allocator.realloc(g_mem_allocator.ctx, pointer, size);
-  const int saved_errno = errno;
-  if (result != nullptr) ObserveAllocation(size, generation);
-  errno = saved_errno;
-  g_thread_sampler.in_hook = false;
-  return result;
+template <PyMemAllocatorEx *Allocator>
+void *Calloc(void *context, size_t count, size_t size) {
+  // Still delegate overflowing requests and suppress nested hooks; never
+  // attribute their wrapped product as a successful allocation size.
+  const bool valid_size = count == 0 || size <= SIZE_MAX / count;
+  return ProfileAllocation(count * size, valid_size, [=]() {
+    return Allocator->calloc(context, count, size);
+  });
 }
 
-void MemFree(void *context, void *pointer) {
-  (void)context;
-  g_mem_allocator.free(g_mem_allocator.ctx, pointer);
+template <PyMemAllocatorEx *Allocator>
+void *Realloc(void *context, void *pointer, size_t size) {
+  return ProfileAllocation(size, true, [=]() {
+    return Allocator->realloc(context, pointer, size);
+  });
 }
 
-void *ObjMalloc(void *context, size_t size) {
-  (void)context;
-  const uint64_t generation =
-      g_active_generation.load(std::memory_order_acquire);
-  if (generation == 0) {
-    return g_obj_allocator.malloc(g_obj_allocator.ctx, size);
-  }
-  if (g_thread_sampler.in_hook) return g_obj_allocator.malloc(g_obj_allocator.ctx, size);
-  g_thread_sampler.in_hook = true;
-  void *result = g_obj_allocator.malloc(g_obj_allocator.ctx, size);
-  const int saved_errno = errno;
-  if (result != nullptr) ObserveAllocation(size, generation);
-  errno = saved_errno;
-  g_thread_sampler.in_hook = false;
-  return result;
+template <PyMemAllocatorEx *Allocator>
+PyMemAllocatorEx WrappedAllocator() {
+  // Allocation traffic needs no free hook. Preserve the original context so
+  // free can keep calling its original function directly, including when a
+  // third-party or debug allocator is underneath us.
+  return {Allocator->ctx, Malloc<Allocator>, Calloc<Allocator>,
+          Realloc<Allocator>, Allocator->free};
 }
 
-void *ObjCalloc(void *context, size_t count, size_t size) {
-  (void)context;
-  const uint64_t generation =
-      g_active_generation.load(std::memory_order_acquire);
-  if (generation == 0) {
-    return g_obj_allocator.calloc(g_obj_allocator.ctx, count, size);
-  }
-  if (g_thread_sampler.in_hook) return g_obj_allocator.calloc(g_obj_allocator.ctx, count, size);
-  g_thread_sampler.in_hook = true;
-  void *result = g_obj_allocator.calloc(g_obj_allocator.ctx, count, size);
-  const int saved_errno = errno;
-  if (result != nullptr && (count == 0 || size <= SIZE_MAX / count)) {
-    ObserveAllocation(count * size, generation);
-  }
-  errno = saved_errno;
-  g_thread_sampler.in_hook = false;
-  return result;
-}
-
-void *ObjRealloc(void *context, void *pointer, size_t size) {
-  (void)context;
-  const uint64_t generation =
-      g_active_generation.load(std::memory_order_acquire);
-  if (generation == 0) {
-    return g_obj_allocator.realloc(g_obj_allocator.ctx, pointer, size);
-  }
-  if (g_thread_sampler.in_hook) return g_obj_allocator.realloc(g_obj_allocator.ctx, pointer, size);
-  g_thread_sampler.in_hook = true;
-  void *result = g_obj_allocator.realloc(g_obj_allocator.ctx, pointer, size);
-  const int saved_errno = errno;
-  if (result != nullptr) ObserveAllocation(size, generation);
-  errno = saved_errno;
-  g_thread_sampler.in_hook = false;
-  return result;
-}
-
-void ObjFree(void *context, void *pointer) {
-  (void)context;
-  g_obj_allocator.free(g_obj_allocator.ctx, pointer);
+bool SameAllocator(const PyMemAllocatorEx &a, const PyMemAllocatorEx &b) {
+  return a.ctx == b.ctx && a.malloc == b.malloc && a.calloc == b.calloc &&
+         a.realloc == b.realloc && a.free == b.free;
 }
 
 void *ReplacementMalloc(void *context, size_t size) {
@@ -664,12 +652,12 @@ bool IsMainInterpreter(PyThreadState *thread_state,
 #else
   *interpreter = thread_state->interp;
 #endif
-  return *interpreter != nullptr && *interpreter == PyInterpreterState_Head();
+  return *interpreter != nullptr && *interpreter == PyInterpreterState_Main();
 }
 
 PyInterpreterState *CurrentMainInterpreter() {
-  if (!PyGILState_Check()) return nullptr;
-  PyThreadState *thread_state = PyThreadState_Get();
+  PyThreadState *thread_state = CurrentThreadStateUnchecked();
+  if (thread_state == nullptr) return nullptr;
   PyInterpreterState *interpreter = nullptr;
   return IsMainInterpreter(thread_state, &interpreter) ? interpreter : nullptr;
 }
@@ -679,11 +667,8 @@ bool HooksIntact() {
   PyMemAllocatorEx obj;
   PyMem_GetAllocator(PYMEM_DOMAIN_MEM, &mem);
   PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &obj);
-  return mem.ctx == &g_mem_allocator && mem.malloc == MemMalloc &&
-         mem.calloc == MemCalloc && mem.realloc == MemRealloc &&
-         mem.free == MemFree && obj.ctx == &g_obj_allocator &&
-         obj.malloc == ObjMalloc && obj.calloc == ObjCalloc &&
-         obj.realloc == ObjRealloc && obj.free == ObjFree;
+  return SameAllocator(mem, WrappedAllocator<&g_mem_allocator>()) &&
+         SameAllocator(obj, WrappedAllocator<&g_obj_allocator>());
 }
 
 void AfterForkChild() {
@@ -919,8 +904,7 @@ bool InitializeMemoryProfiler(uint64_t sampling_interval_bytes) {
 #else
   if (sampling_interval_bytes == 0 ||
       sampling_interval_bytes >
-          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-      !PyGILState_Check()) {
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     return false;
   }
   PyInterpreterState *interpreter = CurrentMainInterpreter();
@@ -951,10 +935,8 @@ bool InitializeMemoryProfiler(uint64_t sampling_interval_bytes) {
 
   PyMem_GetAllocator(PYMEM_DOMAIN_MEM, &g_mem_allocator);
   PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &g_obj_allocator);
-  PyMemAllocatorEx mem = {&g_mem_allocator, MemMalloc, MemCalloc, MemRealloc,
-                          MemFree};
-  PyMemAllocatorEx obj = {&g_obj_allocator, ObjMalloc, ObjCalloc, ObjRealloc,
-                          ObjFree};
+  PyMemAllocatorEx mem = WrappedAllocator<&g_mem_allocator>();
+  PyMemAllocatorEx obj = WrappedAllocator<&g_obj_allocator>();
   PyMem_SetAllocator(PYMEM_DOMAIN_MEM, &mem);
   PyMem_SetAllocator(PYMEM_DOMAIN_OBJ, &obj);
   if (!HooksIntact()) {
@@ -1091,17 +1073,22 @@ bool TestMemorySampling(size_t requested_size, uint64_t interval,
       countdown > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
     return false;
   }
-  Countdown integer_countdown =
-      static_cast<Countdown>(std::ceil(countdown));
-  SampleResult result =
-      EvaluateRequest(requested_size, interval, &integer_countdown);
-  *selected = result.selected;
-  *probability = static_cast<double>(result.probability);
-  *objects = result.selected ? static_cast<double>(1.0L / result.probability)
-                             : 0.0;
-  *bytes = result.selected
-               ? static_cast<double>(requested_size / result.probability)
-               : 0.0;
+  ThreadSampler sampler = {};
+  sampler.interval = interval;
+  sampler.rng = 1;
+  // A zero test countdown means force selection; production uses zero only
+  // as the uninitialized sentinel and gives zero-byte requests a size of one.
+  const Countdown initial = std::max<Countdown>(
+      1, static_cast<Countdown>(std::ceil(countdown)));
+  sampler.countdown_low = static_cast<uint64_t>(initial);
+  sampler.countdown_high = static_cast<uint64_t>(initial >> 64);
+  long double inclusion_probability = 0;
+  *selected = SampleRequest(requested_size, &sampler, &inclusion_probability);
+  *probability = static_cast<double>(inclusion_probability);
+  *objects = *selected ? static_cast<double>(1.0L / inclusion_probability) : 0;
+  *bytes = *selected
+               ? static_cast<double>(requested_size / inclusion_probability)
+               : 0;
   return true;
 }
 
@@ -1128,12 +1115,82 @@ bool TestMemoryCallbackPreservation(bool *exception_preserved,
   return result != nullptr;
 }
 
+bool TestMemoryFastPathPreservation(bool *exception_preserved,
+                                    bool *errno_preserved,
+                                    bool *sample_count_unchanged) {
+  const uint64_t generation =
+      g_active_generation.load(std::memory_order_acquire);
+  if (generation == 0 || !HooksIntact() ||
+      CurrentMainInterpreter() != g_main_interpreter) {
+    return false;
+  }
+
+  ThreadSampler *sampler = CurrentThreadSampler();
+  const ThreadSampler previous = *sampler;
+  sampler->countdown_low = std::numeric_limits<uint64_t>::max();
+  sampler->countdown_high = std::numeric_limits<uint64_t>::max();
+  const uint64_t samples_before = g_data->selected_samples;
+
+  errno = EDOM;
+  void *baseline = g_mem_allocator.malloc(g_mem_allocator.ctx, 64);
+  const int expected_errno = errno;
+  if (baseline == nullptr) {
+    *sampler = previous;
+    return false;
+  }
+  g_mem_allocator.free(g_mem_allocator.ctx, baseline);
+
+  PyErr_SetString(PyExc_RuntimeError, "unsampled callback preservation test");
+  errno = EDOM;
+  void *result = PyMem_Malloc(64);
+  const int observed_errno = errno;
+  *exception_preserved =
+      PyErr_ExceptionMatches(PyExc_RuntimeError) != 0;
+  PyErr_Clear();
+  if (result != nullptr) PyMem_Free(result);
+
+  *errno_preserved = observed_errno == expected_errno;
+  *sample_count_unchanged = g_data->selected_samples == samples_before;
+  *sampler = previous;
+  return result != nullptr;
+}
+
+bool TestMemoryCountdownArithmetic() {
+  ThreadSampler sampler = {};
+  sampler.countdown_low = 100;
+  if (ConsumeCountdownBytes(32, &sampler) ||
+      sampler.countdown_low != 68 || sampler.countdown_high != 0) {
+    return false;
+  }
+
+  sampler.countdown_low = 100;
+  sampler.countdown_high = 1;
+  if (ConsumeCountdownBytes(32, &sampler) ||
+      sampler.countdown_low != 68 || sampler.countdown_high != 1) {
+    return false;
+  }
+
+  sampler.countdown_low = 8;
+  sampler.countdown_high = 1;
+  if (ConsumeCountdownBytes(64, &sampler) ||
+      sampler.countdown_low != static_cast<uint64_t>(0) - 56 ||
+      sampler.countdown_high != 0) {
+    return false;
+  }
+
+  sampler.countdown_low = 64;
+  sampler.countdown_high = 0;
+  return ConsumeCountdownBytes(64, &sampler) &&
+         sampler.countdown_low == 64 && sampler.countdown_high == 0;
+}
+
 bool TestMemoryNestedHook() {
   if (g_active_generation.load(std::memory_order_acquire) == 0 ||
       g_data == nullptr ||
       !MemoryProfilerAvailable()) {
     return false;
   }
+  ThreadSampler *sampler = CurrentThreadSampler();
   long double objects_before = g_data->unknown_objects +
                                g_data->overflow_objects;
   long double bytes_before = g_data->unknown_bytes + g_data->overflow_bytes;
@@ -1141,10 +1198,10 @@ bool TestMemoryNestedHook() {
     objects_before += g_data->stacks[i].objects;
     bytes_before += g_data->stacks[i].bytes;
   }
-  const bool old_guard = g_thread_sampler.in_hook;
-  g_thread_sampler.in_hook = true;
+  const bool old_guard = sampler->in_hook;
+  sampler->in_hook = true;
   void *allocation = PyMem_Malloc(32);
-  g_thread_sampler.in_hook = old_guard;
+  sampler->in_hook = old_guard;
   if (allocation == nullptr) return false;
   PyMem_Free(allocation);
 
@@ -1163,23 +1220,26 @@ bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
                                uint64_t *selected, double *objects,
                                double *bytes) {
   if (interval == 0 || requests == 0) return false;
-  const ThreadSampler previous = g_thread_sampler;
-  g_thread_sampler.rng = seed == 0 ? 1 : seed;
-  g_thread_sampler.generation = 0;
-  g_thread_sampler.in_hook = true;
+  ThreadSampler state = {};
+  ThreadSampler *sampler = &state;
+  sampler->rng = seed == 0 ? 1 : seed;
+  sampler->interval = interval;
+  const Countdown countdown = DrawCountdown(interval, sampler);
+  sampler->countdown_low = static_cast<uint64_t>(countdown);
+  sampler->countdown_high = static_cast<uint64_t>(countdown >> 64);
+  sampler->in_hook = true;
   long double object_total = 0.0L;
   long double byte_total = 0.0L;
   uint64_t selected_total = 0;
   for (uint64_t i = 0; i < requests; ++i) {
-    SampleResult sample = SampleRequest(requested_size, interval, 1);
-    if (sample.selected) {
+    long double probability;
+    if (SampleRequest(requested_size, sampler, &probability)) {
       ++selected_total;
-      object_total += 1.0L / sample.probability;
+      object_total += 1.0L / probability;
       byte_total += static_cast<long double>(requested_size) /
-                    sample.probability;
+                    probability;
     }
   }
-  g_thread_sampler = previous;
   *selected = selected_total;
   *objects = static_cast<double>(object_total);
   *bytes = static_cast<double>(byte_total);

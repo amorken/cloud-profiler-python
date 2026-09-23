@@ -104,6 +104,30 @@ PyObject* TestMemoryCallbackState(PyObject* self, PyObject* args) {
                        PyBool_FromLong(errno_preserved));
 }
 
+PyObject* TestMemoryFastCallbackState(PyObject* self, PyObject* args) {
+  (void)self;
+  if (!PyArg_ParseTuple(args, "")) return nullptr;
+  bool exception_preserved = false;
+  bool errno_preserved = false;
+  bool sample_count_unchanged = false;
+  if (!TestMemoryFastPathPreservation(&exception_preserved,
+                                      &errno_preserved,
+                                      &sample_count_unchanged)) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "memory fast-path test requires active collection");
+    return nullptr;
+  }
+  return Py_BuildValue("(NNN)", PyBool_FromLong(exception_preserved),
+                       PyBool_FromLong(errno_preserved),
+                       PyBool_FromLong(sample_count_unchanged));
+}
+
+PyObject* TestMemoryCountdown(PyObject* self, PyObject* args) {
+  (void)self;
+  if (!PyArg_ParseTuple(args, "")) return nullptr;
+  return PyBool_FromLong(TestMemoryCountdownArithmetic());
+}
+
 PyObject* TestMemoryAllocatorCalls(PyObject* self, PyObject* args) {
   (void)self;
   if (!PyArg_ParseTuple(args, "")) return nullptr;
@@ -194,6 +218,10 @@ PyMethodDef ProfilerMethods[] = {
      "Test-only deterministic sampler helper."},
     {"_memory_test_callback_state", TestMemoryCallbackState, METH_VARARGS,
      "Test-only allocator callback state check."},
+    {"_memory_test_fast_callback_state", TestMemoryFastCallbackState,
+     METH_VARARGS, "Test-only unsampled allocator callback state check."},
+    {"_memory_test_countdown", TestMemoryCountdown, METH_VARARGS,
+     "Test-only countdown carry and borrow check."},
     {"_memory_test_allocator_calls", TestMemoryAllocatorCalls, METH_VARARGS,
      "Test-only allocator operation check."},
     {"_memory_test_nested_hook", TestMemoryNestedHookCall, METH_VARARGS,

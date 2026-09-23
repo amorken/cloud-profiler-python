@@ -45,6 +45,10 @@ bool TestMemorySampling(size_t requested_size, uint64_t interval,
 // errno value. Used by native correctness tests only while collection runs.
 bool TestMemoryCallbackPreservation(bool *exception_preserved,
                                    bool *errno_preserved);
+bool TestMemoryFastPathPreservation(bool *exception_preserved,
+                                   bool *errno_preserved,
+                                   bool *sample_count_unchanged);
+bool TestMemoryCountdownArithmetic();
 bool TestMemoryNestedHook();
 bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
                                uint64_t requests, uint64_t seed,
