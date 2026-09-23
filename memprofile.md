@@ -441,7 +441,8 @@ Reproduction command (use the same runtime/build on both revisions):
   extensions compile in isolated temporary trees.
 - [x] Review measurement code and run both runtime test suites: 36 passed on
   Python 3.12; 35 passed and one unavailable-subinterpreter skip on 3.13.
-- [ ] Use the paired runner to qualify the next production callback revision.
+- [x] Use the paired runner to qualify the next production callback revision;
+  record the remaining failed performance gates in work package 2.
 
 Initial pinned Python 3.12 native OBJ malloc probe, 50 million calls per run,
 three hardware-counter repetitions: delegate-only stage 0 averaged 6.87 billion
@@ -473,3 +474,36 @@ feature. These numbers support reducing work on the unselected callback path.
   CPython 3.12 and 37 passed/1 unavailable-subinterpreter skip on 3.13. The
   ten-pair result leaves the performance gate open, so TLS alternatives are
   next.
+
+## Fixed-cost optimization, work package 3 (2026-09-23)
+
+- [x] Measure isolated x86-64 GNU2 TLS, a separate idle entry, register-held
+  TLS, `-fno-plt`, `-O2`, cold countdown initialization, and branch-layout
+  variants against the same optimized production extension. All variants were
+  built under `/tmp`; none was applied to the distributable extension.
+- [x] Review correctness and portability before selecting a TLS model. GNU2
+  TLS cut the pinned native active OBJ malloc probe by roughly 0.2 ns/request,
+  but [GCC documents additional runtime requirements](https://gcc.gnu.org/onlinedocs/gcc-4.9.4/gcc/i386-and-x86-64-Options.html)
+  and [binutils documents silent failure against glibc without GNU2 TLS runtime
+  fixes](https://lists.nongnu.org/archive/html/bug-binutils/2025-10/msg00023.html).
+  Keep the conservative TLS model for a Python extension loaded on arbitrary
+  supported Linux systems, including after application threads have started.
+- [x] Reject the separate idle entry: with conservative TLS, a pinned native
+  probe measured about 5.03 ns/request idle versus 5.15 ns current, but about
+  8.04 ns/request active versus 7.58 ns current. The remaining compiler options
+  and cold initialization did not show a repeatable improvement in both paths.
+- [x] Run a five-pair, one-second-per-mode Python 3.12 screen of branch-layout
+  hints. Candidate active loss medians were 10.26% small, 11.43% varied, 3.24%
+  deep, and 11.91% four-thread; wide confidence bounds and candidate idle
+  losses gave no basis to promote this variant. Keep the current implementation.
+- [x] Review the package after measurement. Do not make a speculative callback
+  edit merely to lower a single native microbenchmark. The ten-pair production
+  qualification in work package 2 remains the current gate evidence.
+
+The allocator [API contract](https://docs.python.org/3.13/c-api/memory.html)
+requires an allocator installed after interpreter initialization to wrap the
+existing one, and all allocator domains to be thread-safe. Consequently,
+uninstalling the process-lifetime wrapper after each collection is not a safe
+way to erase installed-idle cost. This package does not meet the <=1% idle or
+<=10% active performance gates. Those remain open for a design change that
+preserves allocation accounting and allocator chaining.
