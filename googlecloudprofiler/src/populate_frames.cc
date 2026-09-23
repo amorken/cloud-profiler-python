@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstddef>
+#include <cstring>
 
 #include "stacktraces.h"
 
@@ -30,6 +31,16 @@ bool SafeCopy(void *dst, const void *src, size_t n) {
   long got = syscall(SYS_process_vm_readv, static_cast<long>(getpid()), &local,
                      1UL, &remote, 1UL, 0UL);
   return got == static_cast<long>(n);
+}
+
+template <bool synchronous>
+bool ReadFrame(void *dst, const void *src, size_t n) {
+  if (synchronous) {
+    if (src == nullptr) return false;
+    memcpy(dst, src, n);
+    return true;
+  }
+  return SafeCopy(dst, src, n);
 }
 
 #if PY_VERSION_HEX >= PY_313
@@ -58,10 +69,12 @@ bool SafeCopy(void *dst, const void *src, size_t n) {
 // Reads and validates the code object behind a 3.13 frame's f_executable into
 // *code_copy. Returns the (live) code pointer, or nullptr if the executable is
 // unreadable or is not a code object (f_executable may hold other types).
+template <bool synchronous>
 static PyCodeObject *FrameCode(const _PyInterpreterFrame *fr,
                                PyCodeObject *code_copy) {
   if (fr->f_executable == nullptr ||
-      !SafeCopy(code_copy, fr->f_executable, sizeof(*code_copy)) ||
+      !ReadFrame<synchronous>(code_copy, fr->f_executable,
+                              sizeof(*code_copy)) ||
       Py_TYPE(reinterpret_cast<PyObject *>(code_copy)) != &PyCode_Type) {
     return nullptr;
   }
@@ -83,8 +96,9 @@ static bool FrameIsIncomplete(const _PyInterpreterFrame *fr, PyCodeObject *code,
   return fr->instr_ptr < _PyCode_CODE(code) + code_copy->_co_firsttraceable;
 }
 
-int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
-                   bool *truncated) {
+template <bool synchronous>
+int PopulateFramesImpl(CallFrame *frames, PyThreadState *ts, int max_visited,
+                       bool *truncated) {
   if (truncated != nullptr) *truncated = false;
   if (ts == nullptr) {
     frames[0].lineno = kNoPyState;
@@ -99,11 +113,11 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
          visited < max_visited) {
     visited++;
     _PyInterpreterFrame fr;
-    if (!SafeCopy(&fr, faddr, sizeof(fr))) {
+    if (!ReadFrame<synchronous>(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
     }
     PyCodeObject code_copy;
-    PyCodeObject *code = FrameCode(&fr, &code_copy);
+    PyCodeObject *code = FrameCode<synchronous>(&fr, &code_copy);
     if (code != nullptr && !FrameIsIncomplete(&fr, code, &code_copy)) {
       // Defer line and name/filename resolution to PythonTraces (GIL held).
       // lineno temporarily carries the instruction byte offset; PythonTraces
@@ -120,6 +134,16 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
     *truncated = true;
   }
   return num_frames;
+}
+
+int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
+                   bool *truncated) {
+  return PopulateFramesImpl<false>(frames, ts, max_visited, truncated);
+}
+
+int PopulateFramesSynchronous(CallFrame *frames, PyThreadState *ts,
+                              int max_visited, bool *truncated) {
+  return PopulateFramesImpl<true>(frames, ts, max_visited, truncated);
 }
 
 #elif PY_VERSION_HEX >= PY_312
@@ -148,6 +172,7 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
 // CPython 3.12 _PyFrame_IsIncomplete, reimplemented over a frame copy so the
 // prologue check reads the code object via SafeCopy instead of dereferencing a
 // possibly-invalid pointer.
+template <bool synchronous>
 static bool FrameIsIncomplete(const _PyInterpreterFrame *fr) {
   if (fr->owner == FRAME_OWNED_BY_CSTACK) {
     return true;
@@ -156,14 +181,15 @@ static bool FrameIsIncomplete(const _PyInterpreterFrame *fr) {
     return false;
   }
   PyCodeObject code;
-  if (!SafeCopy(&code, fr->f_code, sizeof(code))) {
+  if (!ReadFrame<synchronous>(&code, fr->f_code, sizeof(code))) {
     return true;  // unreadable code object: treat as incomplete (skip)
   }
   return fr->prev_instr < _PyCode_CODE(fr->f_code) + code._co_firsttraceable;
 }
 
-int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
-                   bool *truncated) {
+template <bool synchronous>
+int PopulateFramesImpl(CallFrame *frames, PyThreadState *ts, int max_visited,
+                       bool *truncated) {
   if (truncated != nullptr) *truncated = false;
   if (ts == nullptr) {
     frames[0].lineno = kNoPyState;
@@ -171,16 +197,16 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
     return 1;
   }
 
-  // ts is the live thread state and safe to read directly. current_frame and
-  // the frame chain it links, however, can be torn/stale/unmapped if SIGPROF
-  // lands mid frame setup or teardown, so each is read with SafeCopy: a bad
-  // pointer aborts the walk instead of faulting.
+  // In the signal handler, the frame chain can be torn or unmapped; ReadFrame
+  // uses SafeCopy there. The synchronous collector runs with the GIL and reads
+  // the same fields directly.
   _PyCFrame *cframe = ts->cframe;
   if (cframe == nullptr) {
     return 0;
   }
   _PyInterpreterFrame *faddr = nullptr;
-  if (!SafeCopy(&faddr, &cframe->current_frame, sizeof(faddr))) {
+  if (!ReadFrame<synchronous>(&faddr, &cframe->current_frame,
+                              sizeof(faddr))) {
     return 0;
   }
 
@@ -190,10 +216,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
          visited < max_visited) {
     visited++;
     _PyInterpreterFrame fr;
-    if (!SafeCopy(&fr, faddr, sizeof(fr))) {
+    if (!ReadFrame<synchronous>(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
     }
-    if (fr.f_code != nullptr && !FrameIsIncomplete(&fr)) {
+    if (fr.f_code != nullptr && !FrameIsIncomplete<synchronous>(&fr)) {
       // Defer line and name/filename resolution to PythonTraces (GIL held).
       // lineno temporarily carries the instruction byte offset; PythonTraces
       // turns it into a source line with PyCode_Addr2Line on the live object.
@@ -209,6 +235,16 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
     *truncated = true;
   }
   return num_frames;
+}
+
+int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
+                   bool *truncated) {
+  return PopulateFramesImpl<false>(frames, ts, max_visited, truncated);
+}
+
+int PopulateFramesSynchronous(CallFrame *frames, PyThreadState *ts,
+                              int max_visited, bool *truncated) {
+  return PopulateFramesImpl<true>(frames, ts, max_visited, truncated);
 }
 
 #elif PY_VERSION_HEX >= PY_311
@@ -326,3 +362,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts, int max_visited,
 }
 
 #endif  // PY_VERSION_HEX >= PY_311
+
+#if PY_VERSION_HEX < PY_312
+int PopulateFramesSynchronous(CallFrame *frames, PyThreadState *ts,
+                              int max_visited, bool *truncated) {
+  return PopulateFrames(frames, ts, max_visited, truncated);
+}
+#endif

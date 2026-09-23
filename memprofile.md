@@ -544,8 +544,12 @@ throughput gates.
   39 available Python 3.12 tests passed. A three-pair, 0.3-second-per-mode
   screen showed high noise, especially in small allocations, and does not
   establish a throughput gain or pass a performance gate.
-- [ ] Add a GIL-held synchronous frame walker for allocation samples on 3.12
+- [x] Add a GIL-held synchronous frame walker for allocation samples on 3.12
   and 3.13, retaining the signal-safe walker for CPU signals and other versions.
+  Share traversal logic through a compile-time reader choice. Both full suites
+  passed in the sandbox, where `process_vm_readv` is denied; allocation frame
+  attribution therefore no longer depends on that syscall. A short matched
+  3.13 screen was inconclusive on throughput.
 - [ ] Add bounded collection-local resolved metadata reuse without retaining
   code objects or changing attribution on cache miss or exhaustion.
 - [ ] Document an allocator hook-switching feasibility decision from CPython

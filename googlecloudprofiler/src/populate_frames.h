@@ -25,4 +25,11 @@ int PopulateFrames(CallFrame* frames, PyThreadState* ts,
                    int max_visited = kMaxFramesToCapture,
                    bool* truncated = nullptr);
 
+// Call only on the currently running interpreter thread with the GIL held.
+// The frame chain is then stable, so allocation profiling can read it directly
+// instead of using the signal handler's guarded process_vm_readv reader.
+int PopulateFramesSynchronous(CallFrame* frames, PyThreadState* ts,
+                              int max_visited = kMaxFramesToCapture,
+                              bool* truncated = nullptr);
+
 #endif  // THIRD_PARTY_PY_GOOGLECLOUDPROFILER_SRC_POPULATE_FRAMES_H_

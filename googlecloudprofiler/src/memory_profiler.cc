@@ -469,9 +469,8 @@ void RecordSelectedAllocation(size_t requested_size, long double probability,
 
   CallFrame captured[kMaxFramesToCapture];
   bool walker_truncated = false;
-  const int frame_count = PopulateFrames(captured, thread_state,
-                                         kMaxFramesToCapture,
-                                         &walker_truncated);
+  const int frame_count = PopulateFramesSynchronous(
+      captured, thread_state, kMaxFramesToCapture, &walker_truncated);
   if (frame_count <= 0) {
     AddUnknown(objects, bytes);
     return;
@@ -552,6 +551,10 @@ void ObserveSelectedAllocation(size_t requested_size, uint64_t generation,
   }
   PyThreadState *thread_state = CurrentThreadStateUnchecked();
   if (thread_state == nullptr) {
+    errno = saved_errno;
+    return;
+  }
+  if (!PyGILState_Check()) {
     errno = saved_errno;
     return;
   }
