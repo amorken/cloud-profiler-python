@@ -31,7 +31,9 @@ def start(service=None,
           disable_cpu_profiling=False,
           disable_wall_profiling=False,
           period_ms=10,
-          discovery_service_url=None):
+          discovery_service_url=None,
+          enable_memory_profiling=False,
+          memory_sampling_interval_bytes=524288):
   """Starts the profiler.
 
   This function starts a daemon thread which polls the profiler server for
@@ -88,13 +90,19 @@ def start(service=None,
     discovery_service_url: Optional discovery service URL override. Only useful
       to developers of the profiler (to specify API key to use with a testing
       API endpoint).
+    enable_memory_profiling: Whether to opt in to sampled allocation traffic
+      profiles. This requires the Linux native profiler runtime and is disabled
+      by default.
+    memory_sampling_interval_bytes: Positive integer mean bytes between
+      allocation samples. Defaults to 524288 (512 KiB). This option is ignored
+      when memory profiling is disabled, but is still validated.
 
   Raises:
     ValueError: If arguments are invalid or if necessary information can't be
       determined from the environment and arguments. Or if service name doesn't
       match '^[a-z0-9]([-a-z0-9_.]{0,253}[a-z0-9])?$'. Or if called from
       a non-main thread when Wall time profiling is enabled. Or if no profiling
-      mode is enabled.
+      mode is enabled. Or if memory profiling options are invalid.
     NotImplementedError: If not run on Linux or Mac.
   """
   global _started
@@ -103,6 +111,15 @@ def start(service=None,
                    'previously called. This function should only be called '
                    'once. This call is ignored.')
     return
+
+  if not isinstance(enable_memory_profiling, bool):
+    raise ValueError('enable_memory_profiling must be a bool')
+  if (not isinstance(memory_sampling_interval_bytes, int) or
+      isinstance(memory_sampling_interval_bytes, bool) or
+      memory_sampling_interval_bytes <= 0 or
+      memory_sampling_interval_bytes > (1 << 63) - 1):
+    raise ValueError(
+        'memory_sampling_interval_bytes must fit a positive pprof int64')
 
   # Adds a StreamHandler with a default Formatter to the root logger.
   # It does nothing if the root logger already has handlers.
@@ -125,7 +142,9 @@ def start(service=None,
   project_id = profiler_client.setup_auth(project_id, service_account_json_file)
   profiler_client.config(project_id, service, service_version,
                          disable_cpu_profiling, disable_wall_profiling,
-                         period_ms, discovery_service_url)
+                         period_ms, discovery_service_url,
+                         enable_memory_profiling,
+                         memory_sampling_interval_bytes)
   logger.info('Google Cloud Profiler Python agent version: %s',
               version.__version__)
   profiler_client.start()

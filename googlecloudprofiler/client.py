@@ -39,6 +39,7 @@ else:
   # CPU profiling is only supported on Linux.
   cpu_profiler = None
 from googlecloudprofiler import pythonprofiler
+from googlecloudprofiler import memory_profiler
 import httplib2
 import requests
 from google.protobuf import duration_pb2
@@ -132,7 +133,9 @@ class Client:
     return project_id
 
   def config(self, project_id, service, service_version, disable_cpu_profiling,
-             disable_wall_profiling, period_ms, discovery_service_url):
+             disable_wall_profiling, period_ms, discovery_service_url,
+             enable_memory_profiling=False,
+             memory_sampling_interval_bytes=524288):
     """Sets up the client config.
 
     Args:
@@ -154,6 +157,10 @@ class Client:
       period_ms: An integer specifying the sampling interval in milliseconds.
       discovery_service_url: A URL that points to the location of the discovery
         service.
+      enable_memory_profiling: Whether sampled allocation profiles should be
+        requested from Cloud Profiler.
+      memory_sampling_interval_bytes: Mean bytes between sampled allocation
+        requests.
 
     Raises:
       ValueError: If the project ID or service can't be determined from the
@@ -161,10 +168,19 @@ class Client:
         '^[a-z0-9]([-a-z0-9_.]{0,253}[a-z0-9])?$'. Or if no profiling mode is
         enabled.
     """
+    if not isinstance(enable_memory_profiling, bool):
+      raise ValueError('enable_memory_profiling must be a bool')
+    if (not isinstance(memory_sampling_interval_bytes, int) or
+        isinstance(memory_sampling_interval_bytes, bool) or
+        memory_sampling_interval_bytes <= 0 or
+        memory_sampling_interval_bytes > (1 << 63) - 1):
+      raise ValueError(
+          'memory_sampling_interval_bytes must fit a positive pprof int64')
+
     self._profilers = {}
     self._config_cpu_profiling(disable_cpu_profiling, period_ms)
     self._config_wall_profiling(disable_wall_profiling, period_ms)
-    if not self._profilers:
+    if not self._profilers and not enable_memory_profiling:
       raise ValueError('No profiling mode is enabled.')
 
     project_id = project_id or retrieve_gce_metadata('project/project-id')
@@ -205,6 +221,26 @@ class Client:
     self._discovery_service_url = googleapiclient.discovery.DISCOVERY_URI
     if discovery_service_url:
       self._discovery_service_url = discovery_service_url
+
+    if enable_memory_profiling:
+      self._config_memory_profiling(memory_sampling_interval_bytes)
+    if not self._profilers:
+      raise ValueError('No profiling mode is enabled.')
+
+  def _config_memory_profiling(self, sampling_interval_bytes):
+    """Initializes and registers allocation profiling when supported."""
+    if not sys.platform.startswith('linux') or cpu_profiler is None:
+      logger.warning(
+          'Memory profiling requires the Linux native profiler runtime; '
+          'HEAP_ALLOC profiling is unavailable.')
+      return
+    profiler = memory_profiler.MemoryProfiler(sampling_interval_bytes)
+    if profiler.available:
+      self._profilers['HEAP_ALLOC'] = profiler
+    else:
+      logger.warning(
+          'Native allocation profiling could not install its allocator '
+          'hooks; HEAP_ALLOC profiling is unavailable.')
 
   def start(self):
     """Starts collecting profiles.
@@ -299,9 +335,17 @@ class Client:
       logger.warning(
           'Failed to collect and upload profile whose profile type is %s: %s',
           profile_type, traceback.format_exc())
+      profiler = self._profilers.get(profile_type)
+      if (profile_type == 'HEAP_ALLOC' and profiler is not None and
+          not profiler.available):
+        self._profilers.pop(profile_type, None)
 
   def _poll_profiler_service(self):
     """Polls the profiler server stoplessly."""
+    if not self._profilers:
+      logger.warning(
+          'Profiler polling stopped because no profiling modes remain')
+      return
     logger.debug('Profiler has started')
     build_service_backoff = backoff.Backoff()
     while self._profiler_service is None:
@@ -315,9 +359,9 @@ class Client:
             '(will retry after %.3fs): %s', backoff_duration, str(e))
         time.sleep(backoff_duration)
 
-    while True:
+    while self._profilers:
       profile = None
-      while not profile:
+      while not profile and self._profilers:
         try:
           logger.debug('Starting to create profile')
           profile = self._create_profile()
@@ -332,7 +376,11 @@ class Client:
                        backoff_duration, str(e))
           time.sleep(backoff_duration)
 
+      if not profile:
+        break
       self._collect_and_upload_profile(profile)
+    logger.warning(
+        'Profiler polling stopped because no profiling modes remain')
 
   def _filter_log(self):
     """Disables logging in the discovery API to avoid excessive logging."""
