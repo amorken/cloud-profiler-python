@@ -16,12 +16,21 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <time.h>
 
 #include "clock.h"
 #include "memory_profiler.h"
 #include "profiler.h"
 
 namespace {
+#ifdef GCLOUDPROFILER_BENCH_STAGE
+PyObject* MemoryDiagnosticStage(PyObject* self, PyObject* args) {
+  (void)self;
+  if (!PyArg_ParseTuple(args, "")) return nullptr;
+  return PyLong_FromLong(GCLOUDPROFILER_BENCH_STAGE);
+}
+#endif
+
 PyObject* ProfileCPU(PyObject* self, PyObject* args) {
   uint64_t duration_nanos = 0;
   uint64_t period_msec = 0;
@@ -167,6 +176,59 @@ PyObject* TestMemoryAllocatorCalls(PyObject* self, PyObject* args) {
       PyBool_FromLong(overflow_calloc_failed));
 }
 
+PyObject* TestMemoryNativeChurn(PyObject* self, PyObject* args) {
+  (void)self;
+  int domain = 0;
+  int operation = 0;
+  unsigned long long count = 0;
+  unsigned long long size = 0;
+  if (!PyArg_ParseTuple(args, "iiKK", &domain, &operation, &count, &size)) {
+    return nullptr;
+  }
+  if ((domain != 1 && domain != 2) || operation < 0 || operation > 2 ||
+      count == 0 || size > SIZE_MAX || size == 0) {
+    PyErr_SetString(PyExc_ValueError, "invalid native churn parameters");
+    return nullptr;
+  }
+  void* (*allocate)(size_t) =
+      domain == 1 ? PyMem_Malloc : PyObject_Malloc;
+  void* (*allocate_zeroed)(size_t, size_t) =
+      domain == 1 ? PyMem_Calloc : PyObject_Calloc;
+  void* (*resize)(void*, size_t) =
+      domain == 1 ? PyMem_Realloc : PyObject_Realloc;
+  void (*release)(void*) = domain == 1 ? PyMem_Free : PyObject_Free;
+
+  struct timespec start, end;
+  if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+    return PyErr_SetFromErrno(PyExc_OSError);
+  }
+  for (unsigned long long i = 0; i < count; ++i) {
+    void* block = operation == 1 ? allocate_zeroed(1, size) :
+                  allocate(operation == 2 ? size / 2 + 1 : size);
+    if (block == nullptr) {
+      PyErr_NoMemory();
+      return nullptr;
+    }
+    if (operation == 2) {
+      void* resized = resize(block, size);
+      if (resized == nullptr) {
+        release(block);
+        PyErr_NoMemory();
+        return nullptr;
+      }
+      block = resized;
+    }
+    release(block);
+  }
+  if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+    return PyErr_SetFromErrno(PyExc_OSError);
+  }
+  const unsigned long long elapsed =
+      (static_cast<unsigned long long>(end.tv_sec) - start.tv_sec) *
+          1000000000ULL + end.tv_nsec - start.tv_nsec;
+  return PyLong_FromUnsignedLongLong(elapsed);
+}
+
 PyObject* TestMemoryNestedHookCall(PyObject* self, PyObject* args) {
   (void)self;
   if (!PyArg_ParseTuple(args, "")) return nullptr;
@@ -203,6 +265,10 @@ PyObject* TestMemoryAllocatorReplacement(PyObject* self, PyObject* args) {
 }
 
 PyMethodDef ProfilerMethods[] = {
+#ifdef GCLOUDPROFILER_BENCH_STAGE
+    {"_memory_diagnostic_stage", MemoryDiagnosticStage, METH_VARARGS,
+     "Benchmark-only native callback stage."},
+#endif
     {"profile_cpu", ProfileCPU, METH_VARARGS, "A function for CPU profiling."},
     {"_memory_initialize", InitializeMemory, METH_VARARGS,
      "Initialize sampled allocation profiling."},
@@ -224,6 +290,8 @@ PyMethodDef ProfilerMethods[] = {
      "Test-only countdown carry and borrow check."},
     {"_memory_test_allocator_calls", TestMemoryAllocatorCalls, METH_VARARGS,
      "Test-only allocator operation check."},
+    {"_memory_test_native_churn", TestMemoryNativeChurn, METH_VARARGS,
+     "Test-only timed native allocator calls."},
     {"_memory_test_nested_hook", TestMemoryNestedHookCall, METH_VARARGS,
      "Test-only nested allocator callback check."},
     {"_memory_test_sequence", TestMemorySamplingSequence, METH_VARARGS,

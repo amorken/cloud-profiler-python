@@ -10,6 +10,7 @@ as JSON; this is a local microbenchmark, not a production qualification.
 import argparse
 import json
 import math
+import os
 import threading
 import time
 
@@ -138,6 +139,9 @@ def main():
       kind: _run_case(kind, args.batches, args.operations_per_batch)
       for kind in kinds
   }
+  results['extension_path'] = os.path.realpath(_profiler.__file__)
+  results['diagnostic_stage'] = getattr(
+      _profiler, '_memory_diagnostic_stage', lambda: 4)()
   if args.case in ('all', 'threads'):
     results['threads_4x'] = _run_threads(args.batches,
                                          args.operations_per_batch)

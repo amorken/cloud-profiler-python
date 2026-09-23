@@ -15,6 +15,7 @@
 
 
 import glob
+import os
 import re
 import sys
 from setuptools import Extension
@@ -33,13 +34,24 @@ install_requires = [
     'requests',
 ]
 
+# Instrumented variants exist only for isolated build_ext benchmarks. They
+# must never enter a wheel, sdist, or editable installation.
+benchmark_stage = os.environ.get('GCLOUDPROFILER_BENCH_STAGE')
+if benchmark_stage is not None:
+  if benchmark_stage not in ('0', '1', '2', '3'):
+    raise ValueError('GCLOUDPROFILER_BENCH_STAGE must be 0, 1, 2, or 3')
+  if 'build_ext' not in sys.argv or '--inplace' not in sys.argv:
+    raise ValueError('diagnostic stages require build_ext --inplace')
+benchmark_flags = (['-DGCLOUDPROFILER_BENCH_STAGE=' + benchmark_stage]
+                   if benchmark_stage is not None else [])
+
 ext_module = [
     Extension(
         'googlecloudprofiler._profiler',
         sources=glob.glob('googlecloudprofiler/src/*.cc'),
         include_dirs=['googlecloudprofiler/src'],
         language='c++',
-        extra_compile_args=['-std=c++11'],
+        extra_compile_args=['-std=c++11'] + benchmark_flags,
         extra_link_args=[
             '-std=c++11',
             '-static-libstdc++',
@@ -114,4 +126,3 @@ setup(
         'Programming Language :: Python :: 3.13',
     ],
 )
-

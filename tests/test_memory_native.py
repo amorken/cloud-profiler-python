@@ -44,6 +44,14 @@ def test_128_bit_countdown_carries_and_borrows():
   assert _profiler._memory_test_countdown()
 
 
+def test_native_allocator_cost_probe_exercises_both_domains():
+  assert not hasattr(_profiler, '_memory_diagnostic_stage')
+  for domain in (1, 2):
+    for operation in (0, 1, 2):
+      assert _profiler._memory_test_native_churn(
+          domain, operation, 100, 128) > 0
+
+
 def test_memory_hooks_and_storage_are_absent_until_opted_in():
   source = r'''
 from googlecloudprofiler import _profiler

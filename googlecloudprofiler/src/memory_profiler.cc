@@ -29,6 +29,11 @@
 #include "populate_frames.h"
 #include "stacktraces.h"
 
+#if defined(GCLOUDPROFILER_BENCH_STAGE) && \
+    (GCLOUDPROFILER_BENCH_STAGE < 0 || GCLOUDPROFILER_BENCH_STAGE > 3)
+#error "invalid diagnostic allocation stage"
+#endif
+
 namespace {
 
 // These limits also bound work performed by an allocation callback. The
@@ -569,9 +574,20 @@ inline void ObserveAllocationCandidate(size_t requested_size,
 template <typename Allocate>
 inline void *ProfileAllocation(size_t size, bool valid_size,
                                const Allocate &allocate) {
+#if defined(GCLOUDPROFILER_BENCH_STAGE) && GCLOUDPROFILER_BENCH_STAGE == 0
+  (void)size;
+  (void)valid_size;
+  return allocate();
+#else
   const uint64_t generation =
       g_active_generation.load(std::memory_order_acquire);
   if (generation == 0) return allocate();
+
+#if defined(GCLOUDPROFILER_BENCH_STAGE) && GCLOUDPROFILER_BENCH_STAGE == 1
+  // Keep the active branch and its load visible in generated code.
+  asm volatile("" : : "r"(generation) : "memory");
+  return allocate();
+#else
 
   // Resolve TLS once and retain its address across the delegate call. Volatile
   // prevents GCC from resolving TLS again after a potentially reentrant call.
@@ -579,11 +595,23 @@ inline void *ProfileAllocation(size_t size, bool valid_size,
   if (sampler->in_hook) return allocate();
   sampler->in_hook = true;
   void *result = allocate();
+#if !defined(GCLOUDPROFILER_BENCH_STAGE) || GCLOUDPROFILER_BENCH_STAGE == 3
   if (result != nullptr && valid_size) {
+#if defined(GCLOUDPROFILER_BENCH_STAGE)
+    long double probability;
+    SampleRequest(size, sampler, &probability);
+#else
     ObserveAllocationCandidate(size, generation, sampler);
+#endif
   }
+#else
+  (void)size;
+  (void)valid_size;
+#endif
   sampler->in_hook = false;
   return result;
+#endif
+#endif
 }
 
 template <PyMemAllocatorEx *Allocator>

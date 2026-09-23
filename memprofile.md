@@ -427,3 +427,27 @@ Reproduction command (use the same runtime/build on both revisions):
   --intervals 4194304 --repeats 5 --batches 1000 \
   --operations-per-batch 1000 --cpu 0
 ```
+
+## Fixed-cost optimization, work package 1 (2026-09-23)
+
+- [x] Add a reference/candidate benchmark runner that runs the same workload
+  source against independently built extensions, randomizes modes and trees,
+  calibrates each case, and checkpoints raw paired results after every repeat.
+- [x] Add benchmark-only compile-time callback stages for delegation,
+  generation checking, TLS/recursion guarding, and countdown sampling. Normal
+  builds cannot expose the diagnostic-stage marker; builds for distribution
+  reject the diagnostic flag.
+- [x] Add a native MEM/OBJ malloc/calloc/realloc probe and verify the diagnostic
+  extensions compile in isolated temporary trees.
+- [x] Review measurement code and run both runtime test suites: 36 passed on
+  Python 3.12; 35 passed and one unavailable-subinterpreter skip on 3.13.
+- [ ] Use the paired runner to qualify the next production callback revision.
+
+Initial pinned Python 3.12 native OBJ malloc probe, 50 million calls per run,
+three hardware-counter repetitions: delegate-only stage 0 averaged 6.87 billion
+user instructions and 1.94 billion cycles; TLS/recursion stage 2 averaged
+8.97 billion instructions and 2.53 billion cycles; sampling stage 3 averaged
+10.09 billion instructions and 2.64 billion cycles. Median native request
+times were approximately 5.1, 7.3, and 8.0 ns. Stages 0-3 are diagnostic
+builds with no meaningful exported allocation profiles and cannot qualify the
+feature. These numbers support reducing work on the unselected callback path.
