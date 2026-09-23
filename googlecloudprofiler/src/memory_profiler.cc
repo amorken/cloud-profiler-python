@@ -209,16 +209,16 @@ inline bool ConsumeCountdownBytes(uint64_t size, ThreadSampler *sampler) {
   return true;
 }
 
-inline bool SampleRequest(size_t requested_size, ThreadSampler *sampler,
-                          long double *probability) {
+// Keep transcendental math and countdown renewal outside the callback's
+// ordinary path. An explicitly separate function also avoids selected-event
+// register spills and stack setup on most unselected requests.
+__attribute__((noinline))
+long double FinishSelectedRequest(size_t requested_size,
+                                  ThreadSampler *sampler) {
   const uint64_t effective_size =
       requested_size == 0 ? 1 : static_cast<uint64_t>(requested_size);
-  if (!ConsumeCountdownBytes(effective_size, sampler)) return false;
-
-  // Probability math and the next countdown are uncommon. Preserve the
-  // underlying allocator's errno without adding errno traffic to misses.
   const int saved_errno = errno;
-  *probability =
+  const long double probability =
       -std::expm1(-static_cast<long double>(effective_size) /
                   static_cast<long double>(sampler->interval));
   errno = saved_errno;
@@ -227,6 +227,15 @@ inline bool SampleRequest(size_t requested_size, ThreadSampler *sampler,
   const Countdown countdown = DrawCountdown(sampler->interval, sampler);
   sampler->countdown_low = static_cast<uint64_t>(countdown);
   sampler->countdown_high = static_cast<uint64_t>(countdown >> 64);
+  return probability;
+}
+
+inline bool SampleRequest(size_t requested_size, ThreadSampler *sampler,
+                          long double *probability) {
+  const uint64_t effective_size =
+      requested_size == 0 ? 1 : static_cast<uint64_t>(requested_size);
+  if (!ConsumeCountdownBytes(effective_size, sampler)) return false;
+  *probability = FinishSelectedRequest(requested_size, sampler);
   return true;
 }
 
@@ -556,6 +565,13 @@ void ObserveSelectedAllocation(size_t requested_size, uint64_t generation,
   errno = saved_errno;
 }
 
+__attribute__((noinline))
+void ObserveSelectedRequest(size_t requested_size, uint64_t generation,
+                            ThreadSampler *sampler) {
+  const long double probability = FinishSelectedRequest(requested_size, sampler);
+  ObserveSelectedAllocation(requested_size, generation, probability);
+}
+
 inline void ObserveAllocationCandidate(size_t requested_size,
                                        uint64_t generation,
                                        ThreadSampler *sampler) {
@@ -563,9 +579,10 @@ inline void ObserveAllocationCandidate(size_t requested_size,
   // unsupported interpreters; selected events are rejected before collector
   // access, and restricting the stream to main-interpreter allocations keeps
   // the same Poisson distribution.
-  long double probability;
-  if (SampleRequest(requested_size, sampler, &probability)) {
-    ObserveSelectedAllocation(requested_size, generation, probability);
+  const uint64_t effective_size =
+      requested_size == 0 ? 1 : static_cast<uint64_t>(requested_size);
+  if (ConsumeCountdownBytes(effective_size, sampler)) {
+    ObserveSelectedRequest(requested_size, generation, sampler);
   }
 }
 
@@ -1243,11 +1260,11 @@ bool TestMemoryNestedHook() {
   return objects_before == objects_after && bytes_before == bytes_after;
 }
 
-bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
-                               uint64_t requests, uint64_t seed,
-                               uint64_t *selected, double *objects,
-                               double *bytes) {
-  if (interval == 0 || requests == 0) return false;
+static bool RunSamplingSequence(const size_t *sizes, size_t size_count,
+                                uint64_t interval, uint64_t requests,
+                                uint64_t seed, uint64_t *selected,
+                                double *objects, double *bytes) {
+  if (interval == 0 || requests == 0 || size_count == 0) return false;
   ThreadSampler state = {};
   ThreadSampler *sampler = &state;
   sampler->rng = seed == 0 ? 1 : seed;
@@ -1260,6 +1277,7 @@ bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
   long double byte_total = 0.0L;
   uint64_t selected_total = 0;
   for (uint64_t i = 0; i < requests; ++i) {
+    const size_t requested_size = sizes[i % size_count];
     long double probability;
     if (SampleRequest(requested_size, sampler, &probability)) {
       ++selected_total;
@@ -1272,6 +1290,22 @@ bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
   *objects = static_cast<double>(object_total);
   *bytes = static_cast<double>(byte_total);
   return true;
+}
+
+bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
+                               uint64_t requests, uint64_t seed,
+                               uint64_t *selected, double *objects,
+                               double *bytes) {
+  return RunSamplingSequence(&requested_size, 1, interval, requests, seed,
+                             selected, objects, bytes);
+}
+
+bool RunMemoryMixedSamplingSequence(uint64_t interval, uint64_t requests,
+                                   uint64_t seed, uint64_t *selected,
+                                   double *objects, double *bytes) {
+  const size_t sizes[] = {32, 256, 4096};
+  return RunSamplingSequence(sizes, 3, interval, requests, seed, selected,
+                             objects, bytes);
 }
 
 bool TestReplaceMemoryAllocator() {

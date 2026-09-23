@@ -52,6 +52,41 @@ def test_native_allocator_cost_probe_exercises_both_domains():
           domain, operation, 100, 128) > 0
 
 
+def test_extension_can_install_hooks_after_worker_thread_starts():
+  source = r'''
+import threading
+import time
+
+ready = threading.Event()
+stop = threading.Event()
+
+def work():
+  ready.set()
+  while not stop.is_set():
+    bytearray(4096)
+
+worker = threading.Thread(target=work)
+worker.start()
+assert ready.wait(5)
+from googlecloudprofiler import _profiler
+assert _profiler._memory_initialize(1048576)
+assert _profiler._memory_start()
+time.sleep(0.05)
+stop.set()
+worker.join()
+traces, duration, start, diagnostics = _profiler._memory_stop()
+assert diagnostics['selected_samples'] > 0
+if not diagnostics['attributed_objects']:
+  print('no-attribution')
+else:
+  assert traces
+'''
+  result = subprocess.run([sys.executable, '-c', source], check=True,
+                          capture_output=True, text=True)
+  if 'no-attribution' in result.stdout:
+    pytest.skip('native frame reads are blocked in this environment')
+
+
 def test_memory_hooks_and_storage_are_absent_until_opted_in():
   source = r'''
 from googlecloudprofiler import _profiler
@@ -91,6 +126,31 @@ def test_seeded_sampler_sequences_are_unbiased_over_repeated_seeds():
   assert abs(total_objects - expected_objects) <= 5 * estimator_sigma
   assert abs(total_bytes - expected_objects * request_size) <= (
       5 * estimator_sigma * request_size)
+
+
+def test_mixed_size_sampler_preserves_object_and_byte_estimates():
+  sizes = (32, 256, 4096)
+  interval = 1000
+  requests = 60000
+  seeds = (1, 2, 3, 17, 0x5EED, 0xDEADBEEF)
+  probabilities = [-math.expm1(-size / interval) for size in sizes]
+  expected_objects = requests * len(seeds)
+  expected_bytes = expected_objects * sum(sizes) / len(sizes)
+  object_variance = (requests * len(seeds) / len(sizes) *
+                     sum((1 - p) / p for p in probabilities))
+  byte_variance = (requests * len(seeds) / len(sizes) *
+                   sum(size * size * (1 - p) / p
+                       for size, p in zip(sizes, probabilities)))
+  object_total = 0
+  byte_total = 0
+  for seed in seeds:
+    selected, objects, bytes_estimate = (
+        _profiler._memory_test_mixed_sequence(interval, requests, seed))
+    assert selected > 0
+    object_total += objects
+    byte_total += bytes_estimate
+  assert abs(object_total - expected_objects) <= 5 * math.sqrt(object_variance)
+  assert abs(byte_total - expected_bytes) <= 5 * math.sqrt(byte_variance)
 
 
 def _run_allocator_process(debug_allocator=False):

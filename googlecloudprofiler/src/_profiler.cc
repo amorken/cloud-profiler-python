@@ -258,6 +258,28 @@ PyObject* TestMemorySamplingSequence(PyObject* self, PyObject* args) {
                        bytes);
 }
 
+PyObject* TestMemoryMixedSamplingSequence(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned long long interval = 0;
+  unsigned long long requests = 0;
+  unsigned long long seed = 0;
+  if (!PyArg_ParseTuple(args, "KKK", &interval, &requests, &seed)) {
+    return nullptr;
+  }
+  uint64_t selected = 0;
+  double objects = 0;
+  double bytes = 0;
+  if (!RunMemoryMixedSamplingSequence(interval, requests, seed, &selected,
+                                      &objects, &bytes)) {
+    PyErr_SetString(PyExc_ValueError,
+                    "interval and request count must be positive");
+    return nullptr;
+  }
+  return Py_BuildValue("(Kdd)",
+                       static_cast<unsigned long long>(selected), objects,
+                       bytes);
+}
+
 PyObject* TestMemoryAllocatorReplacement(PyObject* self, PyObject* args) {
   (void)self;
   if (!PyArg_ParseTuple(args, "")) return nullptr;
@@ -296,6 +318,8 @@ PyMethodDef ProfilerMethods[] = {
      "Test-only nested allocator callback check."},
     {"_memory_test_sequence", TestMemorySamplingSequence, METH_VARARGS,
      "Test-only deterministic seeded sampler sequence."},
+    {"_memory_test_mixed_sequence", TestMemoryMixedSamplingSequence,
+     METH_VARARGS, "Test-only mixed-size seeded sampler sequence."},
     {"_memory_test_replace_allocator", TestMemoryAllocatorReplacement,
      METH_VARARGS, "Test-only allocator replacement trigger."},
     {nullptr, nullptr, 0, nullptr} /* Sentinel */

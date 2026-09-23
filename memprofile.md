@@ -451,3 +451,25 @@ user instructions and 1.94 billion cycles; TLS/recursion stage 2 averaged
 times were approximately 5.1, 7.3, and 8.0 ns. Stages 0-3 are diagnostic
 builds with no meaningful exported allocation profiles and cannot qualify the
 feature. These numbers support reducing work on the unselected callback path.
+
+## Fixed-cost optimization, work package 2 (2026-09-23)
+
+- [x] Move probability calculation, countdown renewal, and the entire selected
+  request handler out of the common allocation callback. The GCC build reduces
+  the OBJ malloc callback stack frame from 0x58 to 0x38 bytes and keeps one TLS
+  resolution on the active path.
+- [x] Review error-state handling, generation fencing, seeded sampling, and
+  allocator chaining after extraction. The full unsandboxed suites remain 36
+  passed on Python 3.12 and 35 passed/1 skipped on 3.13.
+- [x] Reject the nonvolatile sampler pointer experiment: GCC emits multiple
+  `__tls_get_addr` calls after delegation, whereas the retained volatile
+  pointer resolves TLS once. No nonvolatile change is in production code.
+- [x] Run ten-pair, three-second-per-mode Python 3.12 comparison against the
+  committed reference on one pinned CPU. Active loss/95% upper bound:
+  small 8.65/9.71%, varied 8.66/10.85%, deep 2.25/6.59%, and four-thread
+  12.74/13.72%. Varied and threaded churn fail the active gate; installed-idle
+  upper bounds also exceed 1% on small, varied, and threaded workloads.
+- [x] Finish the mixed-size and import-after-workers tests: 38 passed on
+  CPython 3.12 and 37 passed/1 unavailable-subinterpreter skip on 3.13. The
+  ten-pair result leaves the performance gate open, so TLS alternatives are
+  next.

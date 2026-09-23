@@ -55,11 +55,11 @@ def percentile(values, proportion):
                      math.ceil(proportion * len(ordered)) - 1)]
 
 
-def bootstrap_upper(values, seed, draws=10000):
+def bootstrap_bounds(values, seed, draws=10000):
   randomizer = random.Random(seed)
   medians = [statistics.median(
       randomizer.choices(values, k=len(values))) for _ in range(draws)]
-  return percentile(medians, 0.975)
+  return percentile(medians, 0.025), percentile(medians, 0.975)
 
 
 def main():
@@ -137,14 +137,17 @@ def main():
     fields = ('reference_active_loss_percent',
               'candidate_active_loss_percent', 'candidate_idle_loss_percent',
               'candidate_active_p99_change_percent')
-    measurements[case]['summary'] = {
-        field: {
-            'median': statistics.median(row[field] for row in rows),
-            'bootstrap_upper_95': bootstrap_upper(
-                [row[field] for row in rows],
-                args.seed + CASES.index(case) * 10 + fields.index(field)),
-        } for field in fields
-    }
+    summary = {}
+    for index, field in enumerate(fields):
+      values = [row[field] for row in rows]
+      lower, upper = bootstrap_bounds(
+          values, args.seed + CASES.index(case) * 10 + index)
+      summary[field] = {
+          'median': statistics.median(values),
+          'bootstrap_lower_95': lower,
+          'bootstrap_upper_95': upper,
+      }
+    measurements[case]['summary'] = summary
     if args.output:
       write_results(args.output, args, roots, measurements)
   print(json.dumps(report(args, roots, measurements), indent=2, sort_keys=True))

@@ -54,6 +54,9 @@ bool RunMemorySamplingSequence(size_t requested_size, uint64_t interval,
                                uint64_t requests, uint64_t seed,
                                uint64_t *selected, double *objects,
                                double *bytes);
+bool RunMemoryMixedSamplingSequence(uint64_t interval, uint64_t requests,
+                                   uint64_t seed, uint64_t *selected,
+                                   double *objects, double *bytes);
 bool TestReplaceMemoryAllocator();
 
 #endif  // GOOGLECLOUDPROFILER_SRC_MEMORY_PROFILER_H_
