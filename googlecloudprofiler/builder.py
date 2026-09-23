@@ -72,6 +72,73 @@ class Builder:
         location_id = self._location_id(func_id, frame[2])
         sample.location_id.append(location_id)
 
+  def populate_memory_profile(self, traces, sampling_interval_bytes,
+                              duration_ns, start_time_ns,
+                              diagnostics=None):
+    """Populates weighted allocation estimates into a pprof profile.
+
+    `traces` maps leaf-first frame sequences to an `(alloc_objects,
+    alloc_space)` pair. Values have already been weighted and rounded by the
+    native collector; this method validates and encodes them without applying
+    another multiplier.
+    """
+    if (not isinstance(sampling_interval_bytes, int) or
+        isinstance(sampling_interval_bytes, bool) or
+        sampling_interval_bytes <= 0 or
+        sampling_interval_bytes > (1 << 63) - 1):
+      raise ValueError(
+          'sampling_interval_bytes must fit a positive pprof int64')
+    if (not isinstance(duration_ns, int) or isinstance(duration_ns, bool) or
+        duration_ns < 0 or duration_ns > (1 << 63) - 1):
+      raise ValueError('duration_ns must fit a nonnegative pprof int64')
+    if (not isinstance(start_time_ns, int) or isinstance(start_time_ns, bool)
+        or start_time_ns < 0 or start_time_ns > (1 << 63) - 1):
+      raise ValueError('start_time_ns must fit a nonnegative pprof int64')
+
+    profile = self._profile
+    profile.period_type.type = self._string_id('alloc_space')
+    profile.period_type.unit = self._string_id('bytes')
+    profile.period = sampling_interval_bytes
+    profile.duration_nanos = duration_ns
+    profile.time_nanos = start_time_ns
+
+    objects_type = profile.sample_type.add()
+    objects_type.type = self._string_id('alloc_objects')
+    objects_type.unit = self._string_id('count')
+    space_type = profile.sample_type.add()
+    space_type.type = self._string_id('alloc_space')
+    space_type.unit = self._string_id('bytes')
+    profile.default_sample_type = self._string_id('alloc_space')
+
+    if diagnostics is not None:
+      profile.comment.append(self._string_id(
+          'allocation diagnostics: selected={selected_samples}; '
+          'attributed={attributed_objects:.1f}/{attributed_bytes:.1f}; '
+          'unknown={unknown_objects:.1f}/{unknown_bytes:.1f}; '
+          'overflow={overflow_objects:.1f}/{overflow_bytes:.1f}; '
+          'stacks={stack_count}/{stack_capacity}; '
+          'frames={export_frames}/{export_frame_capacity}; '
+          'strings={string_bytes}/{string_bytes_capacity}; '
+          'storage={storage_bytes}; duration_ns={collection_duration_ns}; '
+          'export_ns={export_duration_ns}'.format(**diagnostics)))
+
+    max_int64 = (1 << 63) - 1
+    for trace, estimates in traces.items():
+      if len(estimates) != 2:
+        raise ValueError('allocation trace needs object and byte estimates')
+      objects, allocated_bytes = estimates
+      for value in (objects, allocated_bytes):
+        if (not isinstance(value, int) or isinstance(value, bool) or
+            value < 0 or value > max_int64):
+          raise ValueError('allocation estimate is outside pprof int64 range')
+
+      sample = profile.sample.add()
+      sample.value.extend((objects, allocated_bytes))
+      for frame in trace:
+        func_id = self._function_id(frame[0], frame[1])
+        location_id = self._location_id(func_id, frame[2])
+        sample.location_id.append(location_id)
+
   def emit(self):
     """Returns the profile in gzip-compressed profile proto format."""
     profile = self._profile.SerializeToString()
