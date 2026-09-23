@@ -539,8 +539,11 @@ throughput gates.
   comparison with real stack attribution on Python 3.12. Both sides used the
   same production flags, including frame pointers and stack protection. Short
   two-pair measurements varied substantially and are not gate evidence.
-- [ ] Move first-use countdown initialization and high-word arithmetic out of
-  the common callback, then test and measure a matched build.
+- [x] Move first-use countdown initialization and high-word arithmetic out of
+  the common callback. Review zero-initialized and 128-bit borrow paths; all
+  39 available Python 3.12 tests passed. A three-pair, 0.3-second-per-mode
+  screen showed high noise, especially in small allocations, and does not
+  establish a throughput gain or pass a performance gate.
 - [ ] Add a GIL-held synchronous frame walker for allocation samples on 3.12
   and 3.13, retaining the signal-safe walker for CPU signals and other versions.
 - [ ] Add bounded collection-local resolved metadata reuse without retaining

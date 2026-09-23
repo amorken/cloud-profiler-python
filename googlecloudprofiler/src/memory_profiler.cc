@@ -182,23 +182,24 @@ Countdown DrawCountdown(uint64_t interval, ThreadSampler *sampler) {
 
 // Keep the exponential residual across collection windows. It remains
 // exponential by memorylessness, and the configured interval is immutable.
-inline bool ConsumeCountdownBytes(uint64_t size, ThreadSampler *sampler) {
+__attribute__((noinline))
+bool ConsumeCountdownSlow(uint64_t size, ThreadSampler *sampler) {
   uint64_t countdown_low = sampler->countdown_low;
-  if (countdown_low == 0 && sampler->countdown_high == 0) {
+  uint64_t countdown_high = sampler->countdown_high;
+  if (countdown_low == 0 && countdown_high == 0) {
     // Zero is reserved for a thread that has not sampled its first allocation.
     sampler->interval = g_sampling_interval;
     const Countdown countdown = DrawCountdown(sampler->interval, sampler);
     sampler->countdown_low = static_cast<uint64_t>(countdown);
     sampler->countdown_high = static_cast<uint64_t>(countdown >> 64);
     countdown_low = sampler->countdown_low;
+    countdown_high = sampler->countdown_high;
   }
   if (countdown_low > size) {
-    // The common residual fits in one word. Leave the high word untouched and
-    // avoid the carry chain required for a full 128-bit subtraction.
+    // A new countdown can also fit in one word after first use.
     sampler->countdown_low = countdown_low - size;
     return false;
   }
-  uint64_t countdown_high = sampler->countdown_high;
   if (countdown_high != 0) {
     const uint64_t remaining_low = countdown_low - size;
     if (countdown_low < size) --countdown_high;
@@ -207,6 +208,16 @@ inline bool ConsumeCountdownBytes(uint64_t size, ThreadSampler *sampler) {
     return false;
   }
   return true;
+}
+
+inline bool ConsumeCountdownBytes(uint64_t size, ThreadSampler *sampler) {
+  const uint64_t countdown_low = sampler->countdown_low;
+  if (countdown_low > size) {
+    // The ordinary request needs only one read, compare, and store.
+    sampler->countdown_low = countdown_low - size;
+    return false;
+  }
+  return ConsumeCountdownSlow(size, sampler);
 }
 
 // Keep transcendental math and countdown renewal outside the callback's
