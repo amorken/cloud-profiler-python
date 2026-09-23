@@ -507,3 +507,21 @@ uninstalling the process-lifetime wrapper after each collection is not a safe
 way to erase installed-idle cost. This package does not meet the <=1% idle or
 <=10% active performance gates. Those remain open for a design change that
 preserves allocation accounting and allocator chaining.
+
+The delegation-only stage 0 gave a native OBJ malloc median of 4.39 ns/request
+without hooks and 5.28 ns/request with its hook installed (five 20-million-call
+repetitions, CPU 0). In paired Python workloads with ten two-second runs per
+mode, idle-loss medians were 0.83% for small allocations and -1.47% for four
+threads; both had large pair-to-pair variation. These results identify wrapper
+cost in the native probe but **do not** prove that a 1% idle gate is impossible
+for whole Python workloads. Diagnostic stage 0 does not produce a valid memory
+profile and is not a feature candidate.
+
+After work package 2, the normal CPython 3.12 extension again uploaded CPU and
+HEAP_ALLOC profiles through the real Cloud Profiler API in project
+`kiloclaw-493fed13`, service `heap-sampler-live-20260923-203547-fc8e4e7d`.
+Server readback decoded and matched the locally recorded resolved stack/value
+digests for CPU profile `51e609a4d335cdd2` and HEAP_ALLOC profile
+`5704f51b4b6822d6`. The latter had positive workload-attributed samples and
+the expected 4 MiB period. This confirms end-to-end behavior, not the open
+throughput gates.
