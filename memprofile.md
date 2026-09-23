@@ -1,0 +1,260 @@
+# Sampled allocation profiling implementation
+
+## Context
+
+Add opt-in `HEAP_ALLOC` profiling to the Python Cloud Profiler agent. Sample
+successful allocations in CPython's `PYMEM_DOMAIN_MEM` and `PYMEM_DOMAIN_OBJ`
+domains, attribute samples with the agent's existing native frame walker, and
+upload an in-memory pprof profile through the existing Cloud Profiler flow.
+
+This measures estimated allocation traffic, including allocations freed during
+the interval. It does not measure live heap size. Do not write allocation events
+to disk, start a helper process, or add a Memray/tracemalloc dependency. Keep
+memory profiling disabled by default. The cleaned implementation baseline is
+commit `305314c`.
+
+## Tasks
+
+### Plan and implementation setup
+
+- [x] Review allocator, stack-walker, profile-builder, and upload APIs; settle
+  the design and limits below.
+- [x] Save this checklist in `memprofile.md` before implementation.
+
+### Native allocator sampling
+
+- [x] Add opt-in, process-lifetime MEM/OBJ allocator wrappers that preserve and
+  delegate to the prior allocators and remain pass-through outside collection.
+- [x] Add a thread-local reentrancy guard; preserve allocator return values,
+  resulting `errno`, and Python exception state. Count only successful,
+  outermost allocation requests; do not track frees or pointers.
+- [x] Implement per-thread, per-collection byte-based Poisson sampling. For
+  requested size `s` and mean interval `R`, use `p = -expm1(-max(s, 1) / R)`;
+  selected requests contribute `1/p` estimated objects and `s/p` estimated
+  bytes. Record large requests once and draw a fresh countdown at their end.
+- [x] Check calloc multiplication safely; count successful reallocations using
+  the full new size. Handle zero-byte and failed requests as specified below.
+- [x] Identify the currently attached interpreter before touching sampler or
+  collector state. Pass unsupported interpreter contexts through without
+  profiling.
+- [x] Add deterministic native tests for sampling, estimator weighting,
+  allocator success/failure, calloc, realloc, zero size, and nested hooks.
+
+### Bounded stack attribution and lifecycle
+
+- [x] Reuse `PopulateFrames`; bound both visited and captured frames (128 max).
+- [x] Copy bounded function names and filenames into owned native storage while
+  code objects remain valid. Resolve line numbers with a bounded work budget;
+  use line zero and mark truncated metadata when a budget is exceeded.
+- [x] Add a dedicated weighted stack accumulator capped at 2,048 stacks and
+  16 MiB native storage, with bounded probing and explicit unknown/overflow
+  buckets that preserve estimated totals.
+- [x] Preallocate before collection, use collection generations to handle
+  interval boundaries, reject overlapping requests, and stop recording before
+  profile export.
+- [x] Detect allocator replacement; skip the affected collection and disable
+  later memory profiles without interrupting CPU/WALL profiling.
+- [x] Keep inherited collection inactive after fork. Support worker startup
+  after fork; document that restarting an already-started inherited agent is
+  unsupported in v1.
+- [x] Test concurrent allocation collection, dynamic code-object lifetime,
+  deep stacks, metadata truncation, capacity overflow, overlapping starts,
+  allocator replacement, and fork inactivity.
+- [ ] Run subinterpreter/no-GIL callback tests. Free-threaded builds now refuse
+  initialization, and callbacks verify the main interpreter before sampling;
+  no such runtime is available here, and the extension cannot be imported in a
+  subinterpreter because its dependencies do not support that context.
+- [x] Test collection-boundary transitions, shutdown with active hooks, and
+  repeated storage reuse.
+
+### Profile and agent integration
+
+- [x] Add trailing `start()` options `enable_memory_profiling=False` and
+  `memory_sampling_interval_bytes=524288`; validate before installing hooks.
+- [x] Register a `HEAP_ALLOC` profiler only after native initialization succeeds;
+  reuse existing scheduling, duration, authentication, upload, and retry flow.
+- [x] Encode `alloc_objects/count` and `alloc_space/bytes`, default to
+  `alloc_space`, include the byte sampling period and actual interval metadata,
+  and preserve leaf-first frame order. Do not multiply weighted values again.
+- [x] Preserve symbol sharing in export and emit a valid empty profile for an
+  empty interval.
+- [x] Measure peak memory while exporting the bounded pprof profile.
+- [x] Add bounded per-collection diagnostics for selected samples, attributed,
+  unknown and overflow estimates, storage utilization, and elapsed/export time;
+  include coverage/overflow in pprof comments and concise logs outside callbacks.
+- [x] Add local gzip/protobuf tests, mocked scheduling/upload tests, and tests
+  that CPU/WALL profiles continue to work when memory profiling is unavailable.
+- [x] Document coverage, allocator-request and realloc semantics, sample
+  weighting, limits, unsupported contexts, and the opt-in setting.
+
+### Qualification
+
+- [x] Build and test the available supported Linux CPython runtimes (3.12 and
+  3.13); do not expand Python support in this work.
+- [ ] Complete the supported Linux CPython matrix (3.7–3.13); 3.7–3.11 are not
+  available in this environment.
+- [x] Benchmark disabled, installed-but-idle, and active collection workloads,
+  including allocation churn, multiple sizes, deep/varied stacks, and threads.
+- [ ] Meet gates: zero hooks/storage when disabled; <=1% regression with inactive
+  hooks; <=5% throughput and p99 latency regression during collection; <=1%
+  average regression across scheduled collection; native collector storage
+  <=16 MiB; bounded export with measured peak memory.
+- [ ] Validate in a controlled Cloud Profiler project, then run an opt-in canary.
+
+## Implementation defaults and behavior
+
+- Memory profiling is opt-in, requires the native CPU-profiler runtime support,
+  and is owned by the main interpreter with the GIL enabled. CPU collection need
+  not be active at the same time.
+- Initial mean sampling interval is 512 KiB. Configuration must be a positive
+  integer and remains constant for a collection.
+- Cover only MEM/OBJ requests. RAW-domain and direct native allocation paths,
+  Python freelists, live-heap profiling, subinterpreter support, and additional
+  Python versions are out of scope.
+- Count successful outermost requests. Failed calls do not count or advance the
+  sampler. Successful reallocations count once at the full new requested size;
+  frees pass through. Zero-size calls can count as requests and contribute zero
+  bytes.
+- Frame names and filenames are copied into bounded native storage (maximum
+  1,024 UTF-8 bytes per field); visibly mark truncation. Bound line-table work
+  and use line zero if it exceeds the budget.
+- Sampling and callback failures must not change application allocation
+  behavior. Fractional weights are accumulated and rounded once at export;
+  invalid or overflowing output is rejected.
+- On parent-start/fork, inherited collection remains inactive. Workers should
+  start the agent after fork in v1.
+
+## Validation record
+
+- Runtimes available and tested: CPython 3.12.14 at
+  `/tmp/cloud-profiler-py312/bin/python` and CPython 3.13.15 at
+  `/tmp/cloud-profiler-py313/bin/python`. The system CPython 3.14.4 has no
+  development headers. CPython 3.7–3.11 were not available, so the full
+  supported 3.7–3.13 matrix is still unverified.
+- Build commands and results:
+  `CC=gcc CXX=g++ /tmp/cloud-profiler-py312/bin/python setup.py build_ext --inplace`
+  succeeded on 3.12.14, and
+  `CC=gcc CXX=g++ /tmp/cloud-profiler-py313/bin/python setup.py build_ext --inplace`
+  succeeded on 3.13.15. Both reported the pre-existing
+  `AsyncSafeTraceMultiset::Reset` class-memaccess warning; 3.13 also reported
+  the pre-existing `PyImport_ImportModuleNoBlock` deprecation warning.
+- Full available package tests:
+  `TMPDIR=/tmp /tmp/cloud-profiler-py312/bin/python -m pytest -q` — 19 passed,
+  1 skipped in 1.43s;
+  `TMPDIR=/tmp /tmp/cloud-profiler-py313/bin/python -m pytest -q` — 19 passed,
+  1 skipped in 1.46s. The skip is the bounded attribution test because the
+  default sandbox denies `process_vm_readv` with EPERM. These tests include
+  debug-allocator chaining, callback errno/exception preservation,
+  overlapping-start rejection, fork inactivity, allocator replacement,
+  a six-seed sampler estimator check, diagnostics-to-pprof comments, and
+  mocked scheduling/upload behavior.
+- Shared-walker CPU regression smoke:
+  `TMPDIR=/tmp /tmp/cloud-profiler-py312/bin/python -m pytest -q tests/test_memory_profile.py::test_cpu_profile_smoke_after_shared_frame_walker_change`
+  and the same command with `/tmp/cloud-profiler-py313/bin/python` — each
+  reported `1 passed` (0.40s and 0.39s). Both parsed a gzip/protobuf CPU
+  profile and checked CPU period/type metadata, accepting empty samples under
+  the sandbox's `process_vm_readv` EPERM restriction.
+- Approved unsandboxed bounded-attribution regression:
+  `TMPDIR=/tmp /tmp/cloud-profiler-py312/bin/python -m pytest -q tests/test_memory_native.py::test_bounded_stack_metadata_and_capacity_overflow`
+  and the same command with `/tmp/cloud-profiler-py313/bin/python` — each
+  reported `1 passed in 0.31s`. It verified the 128-frame truncation marker,
+  long function and filename markers, oversized line-table fallback to line
+  zero, the 2,048-stack cap, overflow estimates, and the 65,536-frame export
+  limit on both runtimes. Direct smoke results included a 200,012-byte line
+  table and 305.7 overflow objects / 8,873.3 estimated bytes at capacity.
+- Approved multi-thread and dynamic-code tests ran with the bounded test on both
+  runtimes:
+  `TMPDIR=/tmp /tmp/cloud-profiler-py312/bin/python -m pytest -q tests/test_memory_native.py::test_bounded_stack_metadata_and_capacity_overflow tests/test_memory_native.py::test_multithread_allocation_collection_attributes_worker_frames tests/test_memory_native.py::test_dynamic_code_objects_can_be_released_after_collection`
+  and the same command with `/tmp/cloud-profiler-py313/bin/python` — each
+  reported `3 passed` in about 0.7s. Worker stacks were attributed from four
+  threads; a dynamically compiled function and its code object were released
+  before export while the owned filename/function metadata remained available.
+- Bounded export-memory stress:
+  `PYTHONPATH=. /tmp/cloud-profiler-py312/bin/python benchmarks/measure_memory_export.py`
+  reported 2,048/2,048 stacks, 6,143/65,536 exported frames, 13,246,576 native
+  storage bytes, 1,923,577 bytes of additional Python `tracemalloc` peak during
+  export, a 27,072-byte gzip profile, and 5.71ms native export time. The same
+  command with `/tmp/cloud-profiler-py313/bin/python` measured 1,923,757 bytes
+  additional Python peak, a 27,094-byte gzip profile, and 6.26ms export time.
+  The tracer was installed before allocator-hook initialization so it remained
+  in the delegated allocator chain. Native collector storage is reported
+  separately because `tracemalloc` does not account for that fixed C allocation.
+- Subinterpreter behavior remains unverified. Importing the package in a
+  subinterpreter fails first because `cryptography.hazmat.bindings._rust` does
+  not support that context; bypassing package initialization then fails because
+  `_profiler` itself is not loadable in subinterpreters. The native API now
+  checks the stored main interpreter before starting, checking availability,
+  or stopping, but a callable subinterpreter regression test cannot reach it.
+- Collector memory measurement on CPython 3.12.14:
+  `PYTHONPATH=. /tmp/cloud-profiler-py312/bin/python -c 'from googlecloudprofiler import _profiler; print(_profiler._memory_test_storage_bytes()); assert _profiler._memory_initialize(524288); print(_profiler._memory_test_storage_bytes())'`
+  printed `0` before opt-in and `13246560` bytes after initialization. This is
+  below the 16 MiB cap. A test also asserts zero storage before initialization.
+- In the default sandbox, a direct `process_vm_readv` probe returned `-1` with
+  `errno=1 (EPERM)`, so a sandboxed collection cannot attribute Python stacks.
+  With approved unsandboxed execution, the same probe copied 4 bytes
+  successfully. The active benchmarks below ran unsandboxed and produced
+  multiple attributed traces.
+- Sampler smoke on CPython 3.12.14:
+  `_memory_test_sampler(50, 100, 50)` selected with
+  `p=0.3934693402873666`, object estimate `2.5414940825367984`, and byte
+  estimate `127.07470412683992`; countdown 51 did not select; a zero-byte
+  request used `max(size, 1)` for selection and estimated zero bytes. The
+  callback-state helper returned
+  `(exception_preserved=True, errno_preserved=True)`.
+- Preliminary CPython 3.12.14 overhead run used 200 batches of 1,000 requests
+  for small (32-byte), varied (32/256/4096-byte), and depth-32 allocation
+  workloads, plus four concurrent 128-byte allocation threads. Three baseline
+  and three installed-idle runs had median throughput respectively: small
+  7.22M/8.11M ops/s, varied 6.34M/6.33M, deep 1.368M/1.345M, and four-thread
+  16.75M/16.30M. This run does not establish the <=1% inactive-hook gate; deep
+  and multithread medians exceeded it and run-to-run variation obscured smaller
+  effects.
+- Three active runs with stack attribution had median throughput small
+  5.477M, varied 4.025M, deep 1.197M, and four-thread 10.284M ops/s. Relative
+  to the baseline medians above, regressions were approximately 24%, 36%, 13%,
+  and 39%. Median p99 batch latency (1,000 requests per batch) increased from
+  0.153ms to 0.209ms for small churn, 0.175ms to 0.331ms for varied sizes,
+  1.032ms to 1.102ms for deep stacks, and 0.089ms to 3.925ms in the four-thread
+  case. These measurements fail the <=5% active throughput gate. The overhead
+  qualification is not passed; do not treat this implementation as production
+  ready. Idle results remain unproven against the <=1% gate.
+- A later single-run small-allocation isolation after combining the active flag
+  and sampler state and switching the countdown to integer arithmetic used the
+  same 200 batches of 1,000 operations. Baseline / idle / active at the default
+  512 KiB interval / active at `R=2^62` measured 8.18M / 8.05M / 6.04M / 6.21M
+  ops/s. The very-large-interval run selected no samples and captured no stacks,
+  yet remained 24.1% below baseline; the default active run was 26.2% below.
+  The single-run idle difference was 1.5%, so it does not establish the <=1%
+  idle gate. This isolates a material wrapper/sampler active-path floor from
+  frame walking; optimization stopped because the 5% active gate remains far
+  out of reach.
+- Remaining unchecked work: subinterpreter/no-GIL runtime tests; CPython
+  3.7–3.11 builds; the <=1% inactive and <=5% active throughput/p99 gates,
+  scheduled average gate, controlled Cloud Profiler project validation, and an
+  opt-in canary.
+
+- Follow-up validation for the context and lifecycle changes: the native
+  callback now checks GIL availability and the current interpreter before
+  reading or advancing thread-local sampler state. Builds with
+  `Py_GIL_DISABLED` refuse initialization because the global collector is
+  protected by the GIL. Initialization also fails closed if the process-lifetime
+  at-fork handler cannot be registered. Repeated collection boundary, storage
+  reuse, and active-hook interpreter shutdown tests were added.
+- Latest full validation after those changes: extension builds succeeded on
+  CPython 3.12.14 and 3.13.15. Sandboxed full suites each reported 21 passed,
+  3 skipped because `process_vm_readv` is denied for bounded, multi-threaded,
+  and dynamic-code stack attribution. The authorized unsandboxed full suite
+  reported 24 passed on each runtime, including those attribution tests and the
+  new lifecycle/reuse/shutdown checks.
+- Latest unsandboxed export stress: both interpreters reached 2,048/2,048
+  stacks, 6,143/65,536 export frames, and 13,246,576 native storage bytes.
+  Additional Python `tracemalloc` export peak was 1,923,579 bytes on 3.12 and
+  1,923,725 bytes on 3.13; export took 5.98ms and 5.42ms respectively.
+- Latest CPython 3.12 overhead check used three 200-batch baseline runs and
+  three active runs with attributed stacks. Median baseline/active throughput
+  was 8.23M/5.02M small ops/s, 6.33M/3.49M varied ops/s, 1.36M/1.14M deep
+  ops/s, and 16.60M/9.25M four-thread ops/s: regressions of 39%, 45%, 16%, and
+  44%. Median p99 batch latency rose from 0.152ms to 0.242ms (small), 0.189ms
+  to 0.376ms (varied), 0.864ms to 1.352ms (deep), and 0.094ms to 5.206ms
+  (four-thread). These local runs still fail the active overhead gates; the
+  inactive-hook and scheduled-average gates remain unproven.
