@@ -550,8 +550,17 @@ throughput gates.
   passed in the sandbox, where `process_vm_readv` is denied; allocation frame
   attribution therefore no longer depends on that syscall. A short matched
   3.13 screen was inconclusive on throughput.
-- [ ] Add bounded collection-local resolved metadata reuse without retaining
-  code objects or changing attribution on cache miss or exhaustion.
+- [x] Add bounded collection-local resolved metadata reuse without retaining
+  code objects or changing attribution on cache miss or exhaustion. Cache
+  identity includes exact immutable name, filename, line table, code size,
+  first line, instruction offset, and stack-truncation state. It pins only
+  those three metadata objects, releases them at stop and reset, and bypasses
+  collisions or the 1 MiB retained-object budget. Tests confirm cache hits,
+  code-object collection during profiling, changed line numbers, and fallback
+  at capacity. Fixed native storage is 13,770,880 bytes; combined storage is
+  statically bounded below 16 MiB. Python 3.12 full suite: 40 passed; Python
+  3.13: 39 passed, one unavailable-subinterpreter skip. A short three-pair
+  performance screen remains too noisy for qualification.
 - [ ] Document an allocator hook-switching feasibility decision from CPython
   source without changing hook installation in this iteration.
 - [ ] Run full tests, export stress, and matched ten-pair throughput and p99

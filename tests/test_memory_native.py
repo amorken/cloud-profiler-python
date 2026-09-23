@@ -351,6 +351,8 @@ print(json.dumps({
     'overflow_objects': diagnostics['overflow_objects'],
     'export_frames': diagnostics['export_frames'],
     'export_frame_capacity': diagnostics['export_frame_capacity'],
+    'metadata_cache_bypasses': diagnostics['metadata_cache_bypasses'],
+    'total_storage_bytes': diagnostics['total_storage_bytes'],
 }))
 '''
   result = subprocess.run([sys.executable, '-c', source], check=True,
@@ -368,6 +370,8 @@ print(json.dumps({
   assert report['stack_count'] == report['stack_capacity']
   assert report['overflow_objects'] > 0
   assert report['export_frames'] <= report['export_frame_capacity']
+  assert report['metadata_cache_bypasses'] > 0
+  assert report['total_storage_bytes'] <= 16 * 1024 * 1024
 
 
 def test_multithread_allocation_collection_attributes_worker_frames():
@@ -438,6 +442,52 @@ print(json.dumps({
   if not report['attributed']:
     pytest.skip('process_vm_readv is blocked, so native frame attribution is unavailable')
   assert report['dynamic_frame']
+
+
+def test_metadata_cache_preserves_code_lifetime_and_line_changes():
+  source = r'''
+import gc
+import json
+import weakref
+from googlecloudprofiler import _profiler
+
+assert _profiler._memory_initialize(1)
+namespace = {}
+exec(compile('def cached():\n  return bytearray(64)\n',
+             'cached.py', 'exec'), namespace)
+function = namespace.pop('cached')
+old_code = function.__code__
+old_first = old_code.co_firstlineno
+code_ref = weakref.ref(old_code)
+assert _profiler._memory_start()
+for unused in range(8):
+    function()
+function.__code__ = old_code.replace(co_firstlineno=old_first + 1000)
+del old_code
+gc.collect()
+released = code_ref() is None
+for unused in range(8):
+    function()
+traces, duration, start, diagnostics = _profiler._memory_stop()
+lines = {line for trace in traces for name, filename, line in trace
+         if name == 'cached' and filename == 'cached.py'}
+print(json.dumps({
+    'released': released,
+    'old_line': old_first + 1 in lines,
+    'new_line': old_first + 1001 in lines,
+    'hits': diagnostics['metadata_cache_hits'],
+    'entries': diagnostics['metadata_cache_entries'],
+    'total_storage_bytes': diagnostics['total_storage_bytes'],
+}))
+'''
+  result = subprocess.run([sys.executable, '-c', source], check=True,
+                          capture_output=True, text=True,
+                          env=os.environ.copy())
+  report = json.loads(result.stdout)
+  assert report['released']
+  assert report['old_line'] and report['new_line']
+  assert report['hits'] > 0 and report['entries'] > 0
+  assert report['total_storage_bytes'] <= 16 * 1024 * 1024
 
 
 def test_collection_boundaries_and_repeated_storage_reuse():

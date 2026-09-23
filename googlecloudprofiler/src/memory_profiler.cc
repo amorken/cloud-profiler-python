@@ -49,6 +49,8 @@ const uint32_t kMaxLineLookups = 1000000;
 const uint32_t kMaxLineTableBytes = 64 * 1024;
 const uint32_t kMaxLineBytesPerCollection = 16 * 1024 * 1024;
 const uint32_t kMaxProbe = 16;
+const uint32_t kMetadataCacheSlots = 8192;
+const size_t kMetadataRetentionLimit = 1024 * 1024;
 const char kTruncatedMarker[] = "[truncated]";
 const char kLineTruncatedMarker[] = "[line-truncated]";
 const char kStackTruncatedMarker[] = "[stack-truncated]";
@@ -75,18 +77,38 @@ struct StringEntry {
   uint16_t length;
 };
 
+struct MetadataEntry {
+  PyObject *name;
+  PyObject *filename;
+  PyObject *linetable;
+  uint64_t hash;
+  Py_ssize_t code_size;
+  int first_line;
+  int offset;
+  int line;
+  uint32_t name_id;
+  uint32_t filename_id;
+  bool stack_truncated;
+};
+
 struct CollectorData {
   StackEntry stacks[kMaxStacks];
   uint16_t stack_slots[kStackHashSlots];  // index + 1; zero means empty
   StringEntry strings[kMaxStrings];
   uint32_t string_slots[kStringHashSlots];  // index + 1; zero means empty
   char string_arena[kMaxStringBytes];
+  MetadataEntry metadata[kMetadataCacheSlots];
   uint32_t stack_count;
   uint32_t total_export_frames;
   uint32_t string_count;
   uint32_t string_bytes;
   uint32_t line_lookups;
   uint32_t line_bytes_visited;
+  uint32_t metadata_entries;
+  uint32_t metadata_hits;
+  uint32_t metadata_misses;
+  uint32_t metadata_bypasses;
+  size_t metadata_retained_bytes;
   bool invalid_estimate;
   uint64_t selected_samples;
   long double unknown_objects;
@@ -95,7 +117,8 @@ struct CollectorData {
   long double overflow_bytes;
 };
 
-static_assert(sizeof(CollectorData) <= 16 * 1024 * 1024,
+static_assert(sizeof(CollectorData) + kMetadataRetentionLimit <=
+                  16 * 1024 * 1024,
               "native memory profile storage must stay within 16 MiB");
 
 CollectorData *g_data = nullptr;
@@ -447,6 +470,109 @@ bool FindOrAddStack(const StoredFrame *frames, int frame_count, uint64_t hash,
   return false;
 }
 
+void ClearMetadataCache() {
+  if (g_data == nullptr) return;
+  for (MetadataEntry &entry : g_data->metadata) {
+    if (entry.linetable == nullptr) continue;
+    Py_CLEAR(entry.name);
+    Py_CLEAR(entry.filename);
+    Py_CLEAR(entry.linetable);
+  }
+}
+
+#if PY_VERSION_HEX >= 0x030B0000
+uint64_t MetadataHash(PyCodeObject *code, int offset, bool stack_truncated) {
+  uint64_t hash = 1469598103934665603ULL;
+  const uint64_t values[] = {
+      reinterpret_cast<uintptr_t>(code->co_name),
+      reinterpret_cast<uintptr_t>(code->co_filename),
+      reinterpret_cast<uintptr_t>(code->co_linetable),
+      static_cast<uint64_t>(Py_SIZE(code)),
+      static_cast<uint64_t>(code->co_firstlineno),
+      static_cast<uint64_t>(offset),
+      static_cast<uint64_t>(stack_truncated),
+  };
+  for (uint64_t value : values) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+  }
+  return hash == 0 ? 1 : hash;
+}
+
+MetadataEntry *MetadataSlot(PyCodeObject *code, int offset,
+                            bool stack_truncated, bool *hit) {
+  *hit = false;
+  if (!PyUnicode_CheckExact(code->co_name) ||
+      !PyUnicode_CheckExact(code->co_filename) ||
+      !PyBytes_CheckExact(code->co_linetable)) {
+    ++g_data->metadata_bypasses;
+    return nullptr;
+  }
+  const uint64_t hash = MetadataHash(code, offset, stack_truncated);
+  const uint32_t initial = static_cast<uint32_t>(hash) &
+                           (kMetadataCacheSlots - 1);
+  for (uint32_t probe = 0; probe < kMaxProbe; ++probe) {
+    MetadataEntry *entry = &g_data->metadata[(initial + probe) &
+                                             (kMetadataCacheSlots - 1)];
+    if (entry->linetable == nullptr) {
+      ++g_data->metadata_misses;
+      return entry;
+    }
+    if (entry->hash == hash && entry->name == code->co_name &&
+        entry->filename == code->co_filename &&
+        entry->linetable == code->co_linetable &&
+        entry->code_size == Py_SIZE(code) &&
+        entry->first_line == code->co_firstlineno &&
+        entry->offset == offset &&
+        entry->stack_truncated == stack_truncated) {
+      ++g_data->metadata_hits;
+      *hit = true;
+      return entry;
+    }
+  }
+  ++g_data->metadata_bypasses;
+  return nullptr;
+}
+
+void CacheMetadata(MetadataEntry *entry, PyCodeObject *code, int offset,
+                   bool stack_truncated, const StoredFrame &frame) {
+  if (entry == nullptr || frame.line < 0) return;
+  const size_t name_length = PyUnicode_GET_LENGTH(code->co_name);
+  const size_t filename_length = PyUnicode_GET_LENGTH(code->co_filename);
+  const size_t table_length = PyBytes_GET_SIZE(code->co_linetable);
+  // Charge each retained object conservatively, even if another entry shares
+  // it. A large or colliding entry simply follows the uncached resolver.
+  if (name_length > kMetadataRetentionLimit / 4 ||
+      filename_length > kMetadataRetentionLimit / 4 ||
+      table_length > kMetadataRetentionLimit) {
+    ++g_data->metadata_bypasses;
+    return;
+  }
+  const size_t charge = 384 + 4 * (name_length + filename_length) +
+                        table_length;
+  if (charge > kMetadataRetentionLimit - g_data->metadata_retained_bytes) {
+    ++g_data->metadata_bypasses;
+    return;
+  }
+  Py_INCREF(code->co_name);
+  Py_INCREF(code->co_filename);
+  Py_INCREF(code->co_linetable);
+  entry->name = code->co_name;
+  entry->filename = code->co_filename;
+  entry->hash = MetadataHash(code, offset, stack_truncated);
+  entry->code_size = Py_SIZE(code);
+  entry->first_line = code->co_firstlineno;
+  entry->offset = offset;
+  entry->line = frame.line;
+  entry->name_id = frame.name_id;
+  entry->filename_id = frame.filename_id;
+  entry->stack_truncated = stack_truncated;
+  entry->linetable = code->co_linetable;  // Publish a complete entry last.
+  ++g_data->metadata_entries;
+  g_data->metadata_retained_bytes += charge;
+}
+#endif
+
 void RecordSelectedAllocation(size_t requested_size, long double probability,
                               PyThreadState *thread_state) {
   if (g_data != nullptr &&
@@ -486,6 +612,17 @@ void RecordSelectedAllocation(size_t requested_size, long double probability,
       return;
     }
     PyCodeObject *code = captured[i].py_code;
+    const bool truncated_frame = stack_truncated && i == frame_count - 1;
+#if PY_VERSION_HEX >= 0x030B0000
+    bool metadata_hit = false;
+    MetadataEntry *metadata = MetadataSlot(code, captured[i].lineno,
+                                           truncated_frame, &metadata_hit);
+    if (metadata_hit) {
+      frames[usable_frames++] = {metadata->name_id, metadata->filename_id,
+                                 metadata->line};
+      continue;
+    }
+#endif
     bool line_budget_exceeded = g_data->line_lookups >= kMaxLineLookups;
     int line = captured[i].lineno;
 #if PY_VERSION_HEX >= 0x030B0000
@@ -509,7 +646,7 @@ void RecordSelectedAllocation(size_t requested_size, long double probability,
 #endif
 
     const char *line_marker = line_budget_exceeded ? kLineTruncatedMarker :
-                              (stack_truncated && i == frame_count - 1)
+                              truncated_frame
                                   ? kStackTruncatedMarker
                                   : nullptr;
     uint32_t name_id = 0;
@@ -522,6 +659,12 @@ void RecordSelectedAllocation(size_t requested_size, long double probability,
     frames[usable_frames].name_id = name_id;
     frames[usable_frames].filename_id = filename_id;
     frames[usable_frames].line = line;
+#if PY_VERSION_HEX >= 0x030B0000
+    if (!line_budget_exceeded) {
+      CacheMetadata(metadata, code, captured[i].lineno, truncated_frame,
+                    frames[usable_frames]);
+    }
+#endif
     ++usable_frames;
   }
 
@@ -927,6 +1070,19 @@ PyObject *ExportDiagnostics(int64_t duration_ns, int64_t export_duration_ns) {
       !SetDiagnosticEstimate(diagnostics, "overflow_bytes",
                              g_data->overflow_bytes) ||
       !SetDiagnosticCount(diagnostics, "storage_bytes", sizeof(*g_data)) ||
+      !SetDiagnosticCount(diagnostics, "total_storage_bytes",
+                          sizeof(*g_data) +
+                              g_data->metadata_retained_bytes) ||
+      !SetDiagnosticCount(diagnostics, "metadata_cache_entries",
+                          g_data->metadata_entries) ||
+      !SetDiagnosticCount(diagnostics, "metadata_cache_hits",
+                          g_data->metadata_hits) ||
+      !SetDiagnosticCount(diagnostics, "metadata_cache_misses",
+                          g_data->metadata_misses) ||
+      !SetDiagnosticCount(diagnostics, "metadata_cache_bypasses",
+                          g_data->metadata_bypasses) ||
+      !SetDiagnosticCount(diagnostics, "metadata_retained_bytes",
+                          g_data->metadata_retained_bytes) ||
       !SetDiagnosticCount(diagnostics, "stack_count", g_data->stack_count) ||
       !SetDiagnosticCount(diagnostics, "stack_capacity", kMaxStacks) ||
       !SetDiagnosticCount(diagnostics, "export_frames",
@@ -981,6 +1137,7 @@ bool InitializeMemoryProfiler(uint64_t sampling_interval_bytes) {
     if (g_after_fork) {
       g_main_interpreter = interpreter;
       g_after_fork = false;
+      ClearMetadataCache();
       memset(g_data, 0, sizeof(*g_data));
     }
     return g_main_interpreter == interpreter;
@@ -1044,6 +1201,7 @@ bool StartMemoryProfile() {
   // Check before clearing storage so an overlapping request cannot disturb the
   // active collection.
   if (g_active_generation.load(std::memory_order_acquire) != 0) return false;
+  ClearMetadataCache();
   memset(g_data, 0, sizeof(*g_data));
   uint64_t generation = ++g_next_generation;
   if (generation == 0) generation = ++g_next_generation;
@@ -1072,6 +1230,7 @@ PyObject *StopMemoryProfile() {
                     "memory profiling collection is not active");
     return nullptr;
   }
+  ClearMetadataCache();
   timespec stop_monotonic;
   if (clock_gettime(CLOCK_MONOTONIC, &stop_monotonic) != 0) {
     PyErr_SetFromErrno(PyExc_OSError);
